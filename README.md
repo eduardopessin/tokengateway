@@ -164,6 +164,28 @@ This project is deeply inspired by and built to integrate seamlessly with leadin
 - 🤖 **Compatible Coding Agents**: Built and tested for seamless operation with [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi), [Claude Code](https://claude.ai/code), [OpenHands](https://github.com/All-Hands-AI/OpenHands), [Cline](https://github.com/cline/cline), and [Aider](https://github.com/paul-gauthier/aider).
 
 ---
+## ⚠️ Known Security Issues
+
+This project is a personal homelab tool, not production hardened. The following issues are known and unresolved:
+
+| ID | Severity | Component | Issue |
+|---|---|---|---|
+| TG-001 | 🔴 Critical | `dashboard/server.ts` | `GET /api/credentials` and `POST /api/credentials` have **no authentication**. Any process on the same host or Docker network can read or overwrite all OAuth tokens. |
+| TG-002 | 🔴 Critical | `desktop/src-tauri/src/oauth.rs` | TLS certificate validation is **disabled** (`danger_accept_invalid_certs(true)`) in the Rust HTTP client used to sync credentials to the cluster. Susceptible to MITM on LAN. |
+| TG-003 | 🔴 Critical | `litellm-plugin/sitecustomize.py` | The plugin reads the pod's Kubernetes Service Account token at runtime and uses it to PATCH `secrets/litellm-secrets` on every token refresh. Any RCE in the LiteLLM process grants K8s secret-write capability. |
+| TG-004 | 🟠 High | `docker-compose.yml` | `LITELLM_MASTER_KEY` falls back to a hardcoded default (`sk-quota-gateway-master-key`) if the env var is unset. |
+| TG-005 | 🟠 High | `dashboard/src/store.ts` + `deploy/kubernetes/rbac.yaml` | The dashboard attempts to PATCH a secret in the `litellm` namespace but the declared RBAC `Role` is scoped to `quota-dashboard` only. Either silently fails or implies undeclared cluster permissions. |
+| TG-006 | 🟡 Medium | `dashboard/src/oauth.ts` | OIDC `id_token` is decoded without signature verification — identity claims accepted on trust. |
+| TG-007 | 🟡 Medium | `dashboard/src/oauth.ts` | OAuth callback listener binds `0.0.0.0` during login — ephemeral port open to all interfaces for up to 15 minutes. |
+| TG-008 | 🟡 Medium | `docker-compose.yml` | `credentials.json` is `chmod 0600` but the Docker volume is shared with the LiteLLM container, which can read it if running as root or the same UID. |
+| TG-009 | 🟡 Medium | `desktop/src-tauri/src/lib.rs` | Tauri `open_url` command passes arbitrary URLs to the OS browser opener without validating the scheme (`file://`, `javascript:` accepted). |
+| TG-010 | 🟡 Medium | `litellm-plugin/sitecustomize.py` | Refreshed OAuth tokens are written back to `os.environ`, exposing them via `/proc/self/environ` to co-tenant processes. |
+| TG-011 | 🔵 Low | `desktop/src-tauri/src/oauth.rs` | Google OAuth token exchange does not validate the `state` parameter (CSRF). Anthropic and OpenAI exchanges do. |
+
+**TG-001 is the most immediately exploitable** — no prerequisites, single HTTP request. If you deploy this outside a trusted single-machine environment, add at minimum a shared-secret header check on all `/api/*` routes and bind the dashboard to `127.0.0.1`.
+
+---
+
 
 ## 🤝 Contributing
 
