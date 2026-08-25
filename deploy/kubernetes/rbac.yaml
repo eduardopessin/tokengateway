@@ -1,0 +1,57 @@
+# ServiceAccount for Quota Dashboard
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: quota-dashboard
+  namespace: quota-dashboard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: quota-dashboard-secret-patcher
+  namespace: quota-dashboard
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["quota-dashboard-credentials"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: quota-dashboard-secret-patcher
+  namespace: quota-dashboard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: quota-dashboard-secret-patcher
+subjects:
+  - kind: ServiceAccount
+    name: quota-dashboard
+    namespace: quota-dashboard
+---
+# Cross-namespace secret sync for LiteLLM
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: litellm-quota-dashboard-secret-patcher
+  namespace: quota-dashboard
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["quota-dashboard-credentials"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: litellm-quota-dashboard-secret-patcher
+  namespace: quota-dashboard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: litellm-quota-dashboard-secret-patcher
+subjects:
+  - kind: ServiceAccount
+    name: litellm
+    namespace: litellm

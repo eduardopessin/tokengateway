@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Quota & Cluster Desktop</title>
+<style>
+  :root {
+    --bg: #06090e;
+    --surface: #0c111d;
+    --surface-hover: #111827;
+    --border: #1a2436;
+    --border-subtle: #131c2b;
+    --text: #f1f5f9;
+    --text-muted: #7c8ba1;
+    --text-dim: #475569;
+    
+    --claude: #d97706;
+    --claude-bg: rgba(217, 119, 6, 0.08);
+    --claude-border: rgba(217, 119, 6, 0.25);
+    
+    --openai: #10a37f;
+    --openai-bg: rgba(16, 163, 127, 0.08);
+    --openai-border: rgba(16, 163, 127, 0.25);
+    
+    --google: #38bdf8;
+    --google-bg: rgba(56, 189, 248, 0.08);
+    --google-border: rgba(56, 189, 248, 0.25);
+    
+    --nvidia: #76b900;
+    --nvidia-bg: rgba(118, 185, 0, 0.08);
+    --nvidia-border: rgba(118, 185, 0, 0.25);
+    
+    --kuma: #5cdd8b;
+    --kuma-bg: rgba(92, 221, 139, 0.08);
+    --kuma-border: rgba(92, 221, 139, 0.25);
+    
+    --agent: #a855f7;
+    --agent-bg: rgba(168, 85, 247, 0.08);
+    --agent-border: rgba(168, 85, 247, 0.25);
+    
+    --ok: #10b981;
+    --warn: #f59e0b;
+    --bad: #ef4444;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 14px 16px;
+    margin: 0 auto;
+    font-size: 13.5px;
+    user-select: none;
+    overflow-x: hidden;
+  }
+
+  /* Compact Header */
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    gap: 12px;
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+
+  .brand-icon {
+    width: 28px;
+    height: 28px;
+    background: linear-gradient(135deg, #1e293b, #0f172a);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .brand-icon svg { width: 16px; height: 16px; color: #38bdf8; }
+
+  h1 {
+    font-size: 1.15em;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: #ffffff;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+
+  .subtitle {
+    color: var(--text-dim);
+    font-size: 0.72em;
+    font-weight: 500;
+  }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .live-pill {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: rgba(16, 185, 129, 0.08);
+    border: 1px solid rgba(16, 185, 129, 0.2);
+    color: var(--ok);
+    font-size: 0.7em;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 12px;
+    font-family: monospace;
+  }
+
+  .pulse-dot {
+    width: 5px;
+    height: 5px;
+    background: var(--ok);
+    border-radius: 50%;
+    box-shadow: 0 0 6px var(--ok);
+  }
+
+  button {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 4px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.78em;
+    font-family: inherit;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    transition: all 0.15s ease;
+  }
+
+  button:hover {
+    background: var(--surface-hover);
+    border-color: #334155;
+  }
+
+  button.primary {
+    background: #1e40af;
+    border-color: #2563eb;
+    color: #ffffff;
+  }
+
+  button.primary:hover { background: #1d4ed8; }
+
+  button.danger {
+    color: #f87171;
+    border-color: rgba(239, 68, 68, 0.2);
+    background: rgba(239, 68, 68, 0.04);
+    padding: 2px 7px;
+    font-size: 0.7em;
+  }
+
+  button.danger:hover {
+    background: rgba(239, 68, 68, 0.12);
+    border-color: #ef4444;
+  }
+
+  /* Compact KPI Bar */
+  .kpi-bar {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+
+  .kpi-item {
+    background: var(--surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 7px 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .kpi-label {
+    font-size: 0.7em;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+  }
+
+  .kpi-val {
+    font-size: 0.95em;
+    font-weight: 700;
+    font-family: monospace;
+  }
+
+  /* 2-Column Responsive Card Grid */
+  .cards-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+  }
+
+  .provider-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    transition: border-color 0.15s;
+  }
+
+  .provider-card:hover {
+    border-color: #2e3e57;
+  }
+
+  .provider-card.anthropic { border-left: 3px solid var(--claude); }
+  .provider-card.openai-codex { border-left: 3px solid var(--openai); }
+  .provider-card.google-antigravity { border-left: 3px solid var(--google); }
+  .provider-card.local-vllm { border-left: 3px solid var(--nvidia); }
+  .provider-card.uptime-kuma { border-left: 3px solid var(--kuma); }
+  .provider-card.ai-agents { border-left: 3px solid var(--agent); }
+
+  .card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 9px;
+  }
+
+  .provider-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .logo-box {
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .logo-box.anthropic { background: var(--claude-bg); border: 1px solid var(--claude-border); color: var(--claude); }
+  .logo-box.openai-codex { background: var(--openai-bg); border: 1px solid var(--openai-border); color: var(--openai); }
+  .logo-box.google-antigravity { background: var(--google-bg); border: 1px solid var(--google-border); }
+  .logo-box.local-vllm { background: var(--nvidia-bg); border: 1px solid var(--nvidia-border); color: var(--nvidia); }
+  .logo-box.uptime-kuma { background: var(--kuma-bg); border: 1px solid var(--kuma-border); color: var(--kuma); }
+  .logo-box.ai-agents { background: var(--agent-bg); border: 1px solid var(--agent-border); color: var(--agent); }
+
+  .logo-box svg { width: 15px; height: 15px; }
+
+  .provider-title {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .provider-name {
+    font-size: 0.92em;
+    font-weight: 700;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .provider-email {
+    font-size: 0.68em;
+    color: var(--text-muted);
+    font-family: monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .badge-group {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
+  }
+
+  .pill {
+    font-size: 0.65em;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: #141c2b;
+    color: #94a3b8;
+    border: 1px solid #1e2a3f;
+    font-family: monospace;
+  }
+
+  .pill.peak {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .pill-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+  }
+
+  /* Compact Quota Rows */
+  .quota-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    margin: 4px 0 8px 0;
+  }
+
+  .quota-row {
+    display: grid;
+    grid-template-columns: minmax(135px, 1.3fr) 1fr minmax(75px, auto);
+    gap: 8px;
+    align-items: center;
+  }
+
+  .quota-name {
+    font-size: 0.76em;
+    font-weight: 600;
+    color: #cbd5e1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .quota-track {
+    height: 6px;
+    background: #080c13;
+    border-radius: 3px;
+    border: 1px solid var(--border-subtle);
+    overflow: hidden;
+  }
+
+  .quota-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.4s ease;
+  }
+
+  .quota-stat {
+    font-family: monospace;
+    font-size: 0.72em;
+    color: var(--text-muted);
+    text-align: right;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    justify-content: flex-end;
+  }
+
+  .quota-pct {
+    font-weight: 700;
+    color: var(--text);
+    min-width: 38px;
+  }
+
+  .countdown-badge {
+    font-size: 0.68em;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: #0a111a;
+    border: 1px solid var(--border-subtle);
+    color: #7dd3fc;
+  }
+
+  .countdown-badge.urgent {
+    background: rgba(239, 68, 68, 0.08);
+    border-color: rgba(239, 68, 68, 0.25);
+    color: #fca5a5;
+  }
+
+  /* Compact extra stats bar for vLLM */
+  .extra-stats-bar {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  .mini-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .mini-stat-label {
+    font-size: 0.62em;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+
+  .mini-stat-val {
+    font-size: 0.78em;
+    font-weight: 700;
+    font-family: monospace;
+  }
+
+  /* Uptime Kuma: lista de monitores desligados */
+  .monitor-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 7px;
+    max-height: 140px;
+    overflow-y: auto;
+  }
+
+  .monitor-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 7px;
+    background: rgba(239, 68, 68, 0.06);
+    border: 1px solid rgba(239, 68, 68, 0.18);
+    border-radius: 5px;
+  }
+
+  .monitor-dot {
+    width: 6px;
+    height: 6px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--bad);
+    box-shadow: 0 0 6px var(--bad);
+  }
+
+  .monitor-name {
+    font-family: monospace;
+    font-size: 0.7em;
+    font-weight: 600;
+    color: #fca5a5;
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .err-box {
+    margin-top: 6px;
+    padding: 5px 8px;
+    background: rgba(239, 68, 68, 0.06);
+    border: 1px solid rgba(239, 68, 68, 0.2);
+    color: #fca5a5;
+    border-radius: 5px;
+    font-size: 0.72em;
+    font-family: monospace;
+  }
+
+  .paste-sec {
+    margin-top: 8px;
+    font-size: 0.7em;
+    color: var(--text-muted);
+  }
+
+  .paste-sec summary {
+    cursor: pointer;
+    margin-bottom: 4px;
+  }
+
+  .paste-form {
+    display: flex;
+    gap: 4px;
+  }
+
+  .paste-form input {
+    flex: 1;
+    background: #04070c;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 3px 6px;
+    border-radius: 4px;
+    font-size: 0.75em;
+    font-family: monospace;
+  }
+
+  /* Compact Card footer link */
+  .card-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255,255,255,0.03);
+  }
+
+  .dash-link {
+    color: #38bdf8;
+    font-size: 0.7em;
+    font-weight: 600;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .dash-link:hover { text-decoration: underline; }
+
+  .footer-bar {
+    margin-top: 12px;
+    padding: 8px 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.76em;
+  }
+
+  .toast {
+    position: fixed; bottom: 20px; right: 20px;
+    background: #1e293b; color: var(--text);
+    border: 1px solid #38bdf8; padding: 10px 18px; border-radius: 8px;
+    font-size: 12px; box-shadow: 0 8px 16px rgba(0,0,0,0.5);
+    transition: opacity 0.3s;
+    z-index: 100;
+  }
+  .toast.hidden { opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="brand-icon">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+      </div>
+      <div>
+        <h1>Quota Desktop <span class="subtitle">Loopback Bridge & Cluster Live Sync</span></h1>
+      </div>
+    </div>
+    
+    <div class="header-actions">
+      <div class="live-pill">
+        <div class="pulse-dot"></div>
+        <span>AO VIVO</span>
+      </div>
+      <button class="primary" id="btnSync" onclick="syncCluster()">Sincronizar Cluster</button>
+      <button id="btnWeb" onclick="openWeb()">Abrir Web</button>
+    </div>
+  </header>
+
+  <!-- KPI Bar -->
+  <div class="kpi-bar">
+    <div class="kpi-item">
+      <span class="kpi-label">Provedores</span>
+      <span class="kpi-val" id="kpiConnected">--/3</span>
+    </div>
+    <div class="kpi-item">
+      <span class="kpi-label">Mais Saturado</span>
+      <span class="kpi-val" id="kpiPeak">--</span>
+    </div>
+    <div class="kpi-item">
+      <span class="kpi-label">Próximo Reset</span>
+      <span class="kpi-val" id="kpiNextReset" style="color:#7dd3fc">--</span>
+    </div>
+    <div class="kpi-item">
+      <span class="kpi-label">Hardware Local</span>
+      <span class="kpi-val" id="kpiHardware" style="color:var(--nvidia)">3× RTX 5060 Ti</span>
+    </div>
+  </div>
+
+  <!-- Cards Grid -->
+  <div class="cards-grid" id="cardsGrid"></div>
+
+  <div class="footer-bar">
+    <div>
+      <span style="color:var(--text-muted)">Dashboard:</span> <strong style="color:#38bdf8">http://localhost:3737</strong>
+      <span style="margin-left: 12px; color:var(--text-dim)" id="lastSyncTime"></span>
+    </div>
+    <div style="font-family: monospace; color:var(--text-muted)">
+      Portas: 54545 · 1455 · 51121
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+<script>
+const invoke = window.__TAURI__?.core?.invoke || (async () => null);
+const listen = window.__TAURI__?.event?.listen;
+
+const LOGOS = {
+  anthropic: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M17.48 3.52c-.44-.3-.98-.44-1.52-.4H8.04c-.54-.04-1.08.1-1.52.4-.44.3-.76.74-.88 1.26L2.08 19.34c-.18.7.06 1.44.6 1.9.54.46 1.28.56 1.94.26l4.9-2.22 4.9 2.22c.66.3 1.4.2 1.94-.26.54-.46.78-1.2.6-1.9L13.4 4.78c-.12-.52-.44-.96-.88-1.26z"/></svg>`,
+  "openai-codex": `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M22.28 9.87a5.98 5.98 0 0 0-.52-4.92 6.05 6.05 0 0 0-6.6-2.82A5.98 5.98 0 0 0 10.74.5a6.05 6.05 0 0 0-5.8 4.22 5.98 5.98 0 0 0-4.1 2.9 6.05 6.05 0 0 0 .74 7.2 5.98 5.98 0 0 0 .52 4.92 6.05 6.05 0 0 0 6.6 2.82A5.98 5.98 0 0 0 13.26 23.5a6.05 6.05 0 0 0 5.8-4.22 5.98 5.98 0 0 0 4.1-2.9 6.05 6.05 0 0 0-.88-6.51zM13.26 21.9a4.48 4.48 0 0 1-2.86-.98l.14-.08 4.77-2.76a.79.79 0 0 0 .39-.68v-6.73l2.02 1.17v6.18a4.5 4.5 0 0 1-4.46 3.88zm-8.62-4.13a4.47 4.47 0 0 1-.58-2.98l.14.08 4.77 2.76c.24.14.54.14.78 0l5.83-3.37v2.33l-5.36 3.1a4.5 4.5 0 0 1-5.58-1.92zm-2.02-9.6a4.48 4.48 0 0 1 2.28-2l-.01.16v5.52a.79.79 0 0 0 .39.68l5.83 3.37-2.02 1.17-5.35-3.09a4.5 4.5 0 0 1-1.12-5.81z"/></svg>`,
+  "google-antigravity": `<svg viewBox="0 0 24 24"><path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"/><path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.35 24 12 24z"/><path fill="#FBBC05" d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.18 0 10.04 0 12s.45 3.82 1.25 5.42l4.03-3.15z"/><path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.35 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"/></svg>`,
+  "local-vllm": `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 3a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2H4zm2 4h12v3H6V7zm0 5h7v5H6v-5zm9 0h3v5h-3v-5z"/></svg>`,
+  "uptime-kuma": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h4l2.5-7 3.5 14 3-9 2 2h5"/></svg>`,
+  "ai-agents": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>`
+};
+
+let state = { providers: [], reports: [] };
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.remove('hidden');
+  setTimeout(() => t.classList.add('hidden'), 3500);
+}
+
+function formatCountdown(targetMs) {
+  if (!targetMs) return null;
+  const diff = targetMs - Date.now();
+  if (diff <= 0) return "reset agora";
+  const h = Math.floor(diff / 3600000);
+  const m = Math.floor((diff % 3600000) / 60000);
+  const s = Math.floor((diff % 60000) / 1000);
+  
+  if (h >= 24) {
+    const d = Math.floor(h / 24);
+    return `${d}d ${h % 24}h`;
+  }
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  return `${m}m ${s}s`;
+}
+
+function getGradient(frac) {
+  if (frac >= 0.9) return "linear-gradient(90deg, #f59e0b, #ef4444)";
+  if (frac >= 0.7) return "linear-gradient(90deg, #10b981, #f59e0b)";
+  return "linear-gradient(90deg, #38bdf8, #10b981)";
+}
+
+function getStatusColor(frac) {
+  if (frac >= 0.9) return "var(--bad)";
+  if (frac >= 0.7) return "var(--warn)";
+  return "var(--ok)";
+}
+
+function updateCountdowns() {
+  const elements = document.querySelectorAll('[data-reset-time]');
+  let closestReset = Infinity;
+
+  elements.forEach(el => {
+    const targetMs = parseInt(el.getAttribute('data-reset-time'), 10);
+    if (targetMs) {
+      if (targetMs > Date.now() && targetMs < closestReset) {
+        closestReset = targetMs;
+      }
+      const text = formatCountdown(targetMs);
+      if (text) {
+        el.textContent = "reset " + text;
+        const diff = targetMs - Date.now();
+        if (diff < 3600000) el.classList.add('urgent');
+      }
+    }
+  });
+
+  const cooldownEls = document.querySelectorAll('[data-cooldown-time]');
+  cooldownEls.forEach(el => {
+    const targetMs = parseInt(el.getAttribute('data-cooldown-time'), 10);
+    if (targetMs) {
+      const text = formatCountdown(targetMs);
+      if (text && targetMs > Date.now()) {
+        el.textContent = text;
+      } else {
+        el.textContent = "a expirar...";
+      }
+    }
+  });
+
+  const kpiResetEl = document.getElementById('kpiNextReset');
+  if (closestReset !== Infinity) {
+    kpiResetEl.textContent = formatCountdown(closestReset);
+  } else {
+    kpiResetEl.textContent = "Nenhum";
+  }
+}
+
+function render() {
+  let html = '';
+  let highestFrac = 0;
+  let highestLabel = '--';
+  let connectedCount = 0;
+
+  const standardProviders = [
+    { id: 'anthropic', label: 'Anthropic (Claude Max)', port: 54545 },
+    { id: 'openai-codex', label: 'OpenAI (ChatGPT Plus)', port: 1455 },
+    { id: 'google-antigravity', label: 'Google Antigravity', port: 51121 }
+  ];
+
+  for (const sp of standardProviders) {
+    const p = state.providers.find(x => x.id === sp.id) || { id: sp.id, label: sp.label, connected: false };
+    const report = state.reports.find(r => r.provider === sp.id);
+    
+    if (p.connected || (report && !report.error)) {
+      connectedCount++;
+    }
+
+    const email = (report && report.email) || p.email || 'Não conectado';
+    const plan = (report && report.plan) || p.plan || '';
+
+    html += `<div class="provider-card ${sp.id}">`;
+    html += `<div>
+      <div class="card-header">
+        <div class="provider-meta">
+          <div class="logo-box ${sp.id}">${LOGOS[sp.id] || ''}</div>
+          <div class="provider-title">
+            <span class="provider-name">${sp.label}</span>
+            <span class="provider-email">${email}</span>
+          </div>
+        </div>
+        
+        <div class="badge-group">`;
+        
+        if (plan) html += `<span class="pill">${plan}</span>`;
+        
+        if (report && report.limits && report.limits.length) {
+          const worst = Math.max(...report.limits.map(l => l.usedFraction || 0));
+          const worstPct = Math.round(worst * 100);
+          if (worst > highestFrac) {
+            highestFrac = worst;
+            highestLabel = `${sp.label.split(' ')[0]} ${worstPct}%`;
+          }
+          html += `<span class="pill peak">
+            <span class="pill-dot" style="background:${getStatusColor(worst)}"></span>
+            ${worstPct}%
+          </span>`;
+        }
+        
+        html += `<button class="primary" onclick="login('${sp.id}')">Conectar</button>`;
+        
+    html += `</div></div>`;
+
+    // Quotas progress bars
+    if (report && report.limits && report.limits.length) {
+      html += `<div class="quota-rows">`;
+      for (const l of report.limits) {
+        const pct = Math.min(100, Math.max(0, (l.usedFraction || 0) * 100));
+        html += `<div class="quota-row">
+          <span class="quota-name">${l.label}</span>
+          <div class="quota-track">
+            <div class="quota-fill" style="width:${pct}%;background:${getGradient(l.usedFraction || 0)}"></div>
+          </div>
+          <div class="quota-stat">
+            <span class="quota-pct" style="color:${getStatusColor(l.usedFraction || 0)}">${pct.toFixed(1)}%</span>
+            ${l.resetsAt ? `<span class="countdown-badge" data-reset-time="${l.resetsAt}">reset ...</span>` : ''}
+          </div>
+        </div>`;
+      }
+      html += `</div>`;
+    }
+
+    if (report && report.error) {
+      if (report.cooldownUntil && report.cooldownUntil > Date.now()) {
+        html += `<div class="err-box" style="display:flex;align-items:center;justify-content:space-between;gap:6px">
+          <span>⚠️ Rate limit na consulta de quota</span>
+          <span class="countdown-badge urgent">cooldown: <strong data-cooldown-time="${report.cooldownUntil}">...</strong></span>
+        </div>`;
+      } else {
+        html += `<div class="err-box">${report.error}</div>`;
+      }
+    }
+
+    html += `<details class="paste-sec">
+      <summary>Colar Callback Manual (Porta ${sp.port})</summary>
+      <div class="paste-form">
+        <input id="paste-${sp.id}" placeholder="Cole o código ou URL final...">
+        <button class="primary" onclick="paste('${sp.id}')">OK</button>
+      </div>
+    </details>`;
+
+    html += `</div>`; // end top group
+
+    if (report && report.dashboardUrl) {
+      html += `<div class="card-footer">
+        <span class="dash-link" onclick="openUrl('${report.dashboardUrl}')">Dashboard Oficial ↗</span>
+      </div>`;
+    }
+
+    html += `</div>`;
+  }
+
+  // 4. vLLM Local Cluster Card
+  const vllmReport = state.reports.find(r => r.provider === 'local-vllm');
+  if (vllmReport) {
+    html += `<div class="provider-card local-vllm">
+      <div>
+        <div class="card-header">
+          <div class="provider-meta">
+            <div class="logo-box local-vllm">${LOGOS['local-vllm']}</div>
+            <div class="provider-title">
+              <span class="provider-name">${vllmReport.label}</span>
+              <span class="provider-email">${vllmReport.email}</span>
+            </div>
+          </div>
+          <div class="badge-group">
+            <span class="pill">${vllmReport.plan || 'qwen3.8-27b'}</span>
+            <span class="pill peak"><span class="pill-dot" style="background:var(--nvidia)"></span>Local</span>
+          </div>
+        </div>`;
+
+        if (vllmReport.limits && vllmReport.limits.length) {
+          html += `<div class="quota-rows">`;
+          for (const l of vllmReport.limits) {
+            const pct = Math.min(100, Math.max(0, (l.usedFraction || 0) * 100));
+            const isVram = l.id === 'vllm:vram_allocation';
+            const barGradient = isVram ? 'linear-gradient(90deg, #76b900, #84cc16)' : 'linear-gradient(90deg, #0284c7, #10b981)';
+            const statColor = isVram ? 'var(--nvidia)' : '#38bdf8';
+            html += `<div class="quota-row">
+              <span class="quota-name">${l.label}</span>
+              <div class="quota-track">
+                <div class="quota-fill" style="width:${pct}%;background:${barGradient}"></div>
+              </div>
+              <div class="quota-stat"><span class="quota-pct" style="color:${statColor}">${pct.toFixed(1)}%</span></div>
+            </div>`;
+          }
+          html += `</div>`;
+        }
+
+        if (vllmReport.extraStats) {
+          html += `<div class="extra-stats-bar">
+            <div class="mini-stat"><span class="mini-stat-label">Ativos</span><span class="mini-stat-val" style="color:#38bdf8">${vllmReport.extraStats.runningReqs || 0} reqs</span></div>
+            <div class="mini-stat"><span class="mini-stat-label">Fila</span><span class="mini-stat-val">${vllmReport.extraStats.waitingReqs || 0}</span></div>
+            <div class="mini-stat"><span class="mini-stat-label">Cache Hit</span><span class="mini-stat-val" style="color:#10b981">${vllmReport.extraStats.cacheHitRate || '--'}</span></div>
+            <div class="mini-stat"><span class="mini-stat-label">Tokens</span><span class="mini-stat-val">${(vllmReport.extraStats.tokensGenerated || 0).toLocaleString()}</span></div>
+          </div>`;
+        }
+      html += `</div></div>`;
+  }
+
+  // 5. Uptime Kuma Card
+  const kumaReport = state.reports.find(r => r.provider === 'uptime-kuma');
+  if (kumaReport) {
+    const downList = kumaReport.downMonitors || [];
+    const stats = kumaReport.extraStats || {};
+    const downColor = downList.length ? 'var(--bad)' : 'var(--ok)';
+    html += `<div class="provider-card uptime-kuma">
+      <div>
+        <div class="card-header">
+          <div class="provider-meta">
+            <div class="logo-box uptime-kuma">${LOGOS['uptime-kuma']}</div>
+            <div class="provider-title">
+              <span class="provider-name">${kumaReport.label}</span>
+              <span class="provider-email">${kumaReport.email}</span>
+            </div>
+          </div>
+          <div class="badge-group">
+            <span class="pill peak">
+              <span class="pill-dot" style="background:${downColor}"></span>
+              ${downList.length} desligado${downList.length === 1 ? '' : 's'}
+            </span>
+          </div>
+        </div>
+        <div class="extra-stats-bar">
+          <div class="mini-stat"><span class="mini-stat-label">Monitores</span><span class="mini-stat-val">${stats.total || 34}</span></div>
+          <div class="mini-stat"><span class="mini-stat-label">Ligados</span><span class="mini-stat-val" style="color:var(--ok)">${stats.up || 32}</span></div>
+          <div class="mini-stat"><span class="mini-stat-label">Desligados</span><span class="mini-stat-val" style="color:var(--bad)">${stats.down || 2}</span></div>
+          <div class="mini-stat"><span class="mini-stat-label">Pendentes</span><span class="mini-stat-val" style="color:var(--warn)">${stats.pending || 0}</span></div>
+        </div>`;
+
+        if (downList.length) {
+          html += `<div class="monitor-list">`;
+          for (const m of downList) {
+            html += `<div class="monitor-row">
+              <div class="monitor-dot"></div>
+              <span class="monitor-name">${m.name}</span>
+            </div>`;
+          }
+          html += `</div>`;
+        }
+      html += `</div></div>`;
+  }
+
+  // 6. AI Agents Card
+  const agentReport = state.reports.find(r => r.provider === 'ai-agents');
+  if (agentReport) {
+    const stats = agentReport.extraStats || {};
+    html += `<div class="provider-card ai-agents">
+      <div>
+        <div class="card-header">
+          <div class="provider-meta">
+            <div class="logo-box ai-agents">${LOGOS['ai-agents']}</div>
+            <div class="provider-title">
+              <span class="provider-name">${agentReport.label}</span>
+              <span class="provider-email">${agentReport.email}</span>
+            </div>
+          </div>
+          <div class="badge-group">
+            <span class="pill peak">
+              <span class="pill-dot" style="background:var(--ok)"></span>
+              ${stats.agentsCount || 4} ativos
+            </span>
+          </div>
+        </div>
+        <div class="extra-stats-bar">
+          <div class="mini-stat"><span class="mini-stat-label">Agentes</span><span class="mini-stat-val" style="color:#a855f7">${stats.agentsCount || 4}</span></div>
+          <div class="mini-stat"><span class="mini-stat-label">Nós K3s</span><span class="mini-stat-val">${stats.k3sNodes ?? 0}</span></div>
+          <div class="mini-stat"><span class="mini-stat-label">VMs PVE</span><span class="mini-stat-val">${stats.proxmoxVms ?? 0}</span></div>
+          <div class="mini-stat"><span class="mini-stat-label">Sandboxes</span><span class="mini-stat-val" style="color:var(--ok)">${stats.activeSandboxes || 1}</span></div>
+        </div>
+      </div></div>`;
+  }
+
+  document.getElementById('cardsGrid').innerHTML = html;
+  document.getElementById('kpiConnected').textContent = `${connectedCount}/3`;
+  document.getElementById('kpiPeak').textContent = highestLabel;
+  updateCountdowns();
+}
+
+async function refresh() {
+  try {
+    const [statusData, usageData] = await Promise.all([
+      invoke('get_status').catch(() => []),
+      invoke('get_cluster_usage', { clusterUrl: null }).catch(() => null)
+    ]);
+    state.providers = statusData || [];
+    if (usageData && usageData.reports) {
+      state.reports = usageData.reports;
+    }
+    render();
+    document.getElementById('lastSyncTime').textContent = "Atualizado: " + new Date().toLocaleTimeString();
+  } catch (e) {
+    console.error('Refresh error:', e);
+  }
+}
+
+async function login(provider) {
+  try {
+    toast('A abrir navegador padrão...');
+    await invoke('start_login', { provider });
+  } catch (e) {
+    toast('Erro: ' + e);
+  }
+}
+
+async function paste(provider) {
+  const inp = document.getElementById('paste-' + provider);
+  if (!inp || !inp.value.trim()) return;
+  try {
+    toast('A trocar token...');
+    await invoke('paste_redirect', { provider, urlOrCode: inp.value.trim() });
+    inp.value = '';
+    toast('✅ Autenticado com sucesso!');
+    refresh();
+  } catch (e) {
+    toast('Erro: ' + e);
+  }
+}
+
+async function syncCluster() {
+  try {
+    toast('A sincronizar com o cluster Kubernetes...');
+    const res = await invoke('sync_to_cluster', { clusterUrl: null });
+    toast('✅ ' + res);
+    refresh();
+  } catch (e) {
+    toast('Erro: ' + e);
+  }
+}
+
+function openUrl(url) {
+  invoke('open_url', { url });
+}
+
+function openWeb() {
+  invoke('open_url', { url: 'http://localhost:3737' });
+}
+
+if (listen) {
+  listen('oauth-success', (ev) => {
+    toast('🎉 Token capturado para ' + ev.payload.provider + '! Sincronizando...');
+    refresh();
+  });
+}
+
+refresh();
+setInterval(refresh, 15000);
+setInterval(updateCountdowns, 1000);
+</script>
+</body>
+</html>

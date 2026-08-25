@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  quota-dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: quota-dashboard
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3737}:3737"
+    environment:
+      - PORT=3737
+      - CREDENTIALS_PATH=/app/data/credentials.json
+      - VLLM_METRICS_URL=${VLLM_METRICS_URL:-}
+      - UPTIME_KUMA_URL=${UPTIME_KUMA_URL:-}
+    volumes:
+      - quota_data:/app/data
+
+  litellm:
+    image: ghcr.io/berriai/litellm-database:main-latest
+    container_name: litellm-gateway
+    restart: unless-stopped
+    ports:
+      - "${LITELLM_PORT:-4000}:4000"
+    environment:
+      - PYTHONPATH=/app/patch
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-quota-gateway-master-key}
+    volumes:
+      - ./litellm-plugin/sitecustomize.py:/app/patch/sitecustomize.py:ro
+      - ./deploy/docker/litellm-config.yaml:/app/config.yaml:ro
+      - quota_data:/app/quota-data:ro
+
+volumes:
+  quota_data:

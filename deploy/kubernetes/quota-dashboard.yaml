@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quota-dashboard
+  namespace: quota-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: quota-dashboard
+  template:
+    metadata:
+      labels:
+        app: quota-dashboard
+    spec:
+      serviceAccountName: quota-dashboard
+      containers:
+        - name: quota-dashboard
+          image: ghcr.io/yourusername/quota-dashboard:latest
+          ports:
+            - containerPort: 3737
+              name: http
+          env:
+            - name: PORT
+              value: "3737"
+            - name: CREDENTIALS_PATH
+              value: "/app/data/credentials.json"
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: quota-dashboard-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: quota-dashboard
+  namespace: quota-dashboard
+spec:
+  ports:
+    - port: 3737
+      targetPort: 3737
+      name: http
+  selector:
+    app: quota-dashboard

@@ -1,0 +1,25 @@
+# Build outputs
+target/
+**/target/
+dist/
+**/dist/
+build/
+**/build/
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment and secrets
+.env
+.env.local
+credentials.json
+**/credentials.json

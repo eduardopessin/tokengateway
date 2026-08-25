@@ -1,0 +1,45 @@
+model_list:
+  # --- Anthropic Claude Models ---
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: claude-3-7-sonnet-20250219
+      api_key: os.environ/ANTHROPIC_OAUTH_TOKEN
+
+  - model_name: claude-opus-5
+    litellm_params:
+      model: claude-3-opus-20240229
+      api_key: os.environ/ANTHROPIC_OAUTH_TOKEN
+
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: claude-3-5-haiku-20241022
+      api_key: os.environ/ANTHROPIC_OAUTH_TOKEN
+
+  # --- OpenAI Codex Models ---
+  - model_name: gpt-5.6-terra
+    litellm_params:
+      model: openai/gpt-5.6-terra
+      api_key: os.environ/OPENAI_CODEX_OAUTH_TOKEN
+      custom_llm_provider: openai
+
+  - model_name: gpt-5.4
+    litellm_params:
+      model: openai/gpt-5.4
+      api_key: os.environ/OPENAI_CODEX_OAUTH_TOKEN
+      custom_llm_provider: openai
+
+  # --- Google Antigravity Models ---
+  - model_name: gemini-3.7-flash
+    litellm_params:
+      model: openai/gemini-3.7-flash
+      api_key: os.environ/GOOGLE_ANTIGRAVITY_OAUTH_TOKEN
+      custom_llm_provider: openai
+
+  - model_name: gemini-2.5-pro
+    litellm_params:
+      model: openai/gemini-2.5-pro
+      api_key: os.environ/GOOGLE_ANTIGRAVITY_OAUTH_TOKEN
+      custom_llm_provider: openai
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
