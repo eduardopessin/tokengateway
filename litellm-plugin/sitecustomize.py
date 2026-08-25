@@ -41,41 +41,79 @@ try:
         if hasattr(_Mgr, _n):
             _wrap(_n)
             _patched.append(_n)
-    print(f"[sitecustomize] LiteLLM MCP spec-server patch applied: {_patched}", file=sys.stderr)
+    print(f"[sitecustomize] litellm mcp spec-server patch aplicado: {_patched}", file=sys.stderr)
 except Exception as _e:
-    print(f"[sitecustomize] LiteLLM MCP patch skipped: {_e}", file=sys.stderr)
+    print(f"[sitecustomize] litellm mcp patch ignorado: {_e}", file=sys.stderr)
 
-# --- helper: atomically persist tokens across Kubernetes Secrets ---
+# --- helper: persiste tokens atomicamente em litellm-secrets E quota-dashboard-credentials ---
 def _persist_tokens_to_secret(updates: dict):
     try:
         sa_token = open('/var/run/secrets/kubernetes.io/serviceaccount/token').read()
         ca = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
-        ns = open('/var/run/secrets/kubernetes.io/serviceaccount/namespace').read().strip()
         host = os.environ.get('KUBERNETES_SERVICE_HOST', 'kubernetes.default.svc')
         port = os.environ.get('KUBERNETES_SERVICE_PORT', '443')
-        patch = {k: base64.b64encode(v.encode()).decode() for k, v in updates.items() if v}
-        if not patch:
-            return
-        body = json.dumps({'data': patch}).encode()
-        req = urllib.request.Request(
-            f'https://{host}:{port}/api/v1/namespaces/{ns}/secrets/litellm-secrets',
-            data=body, method='PATCH',
-            headers={
-                'Authorization': f'Bearer {sa_token}',
-                'Content-Type': 'application/strategic-merge-patch+json'
-            }
-        )
         ctx = ssl.create_default_context(cafile=ca)
-        urllib.request.urlopen(req, context=ctx, timeout=5)
-        print(f"[TokenManager] litellm-secrets persisted: {list(updates.keys())}", file=sys.stderr)
-    except Exception as e:
-        print(f"[TokenManager] Warning: failed to persist secret: {e}", file=sys.stderr)
 
-# --- 2. In-Memory Token Manager with Auto-Refresh ---
-ANTHROPIC_CLIENT_ID = os.environ.get("ANTHROPIC_CLIENT_ID", "")
-CODEX_CLIENT_ID = os.environ.get("CODEX_CLIENT_ID", "")
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+        # 1. Atualizar litellm-secrets no namespace litellm
+        patch = {k: base64.b64encode(v.encode()).decode() for k, v in updates.items() if v}
+        if patch:
+            body = json.dumps({'data': patch}).encode()
+            req = urllib.request.Request(
+                f'https://{host}:{port}/api/v1/namespaces/litellm/secrets/litellm-secrets',
+                data=body, method='PATCH',
+                headers={
+                    'Authorization': f'Bearer {sa_token}',
+                    'Content-Type': 'application/strategic-merge-patch+json'
+                }
+            )
+            urllib.request.urlopen(req, context=ctx, timeout=5)
+            print(f"[TokenManager] litellm-secrets persistido: {list(updates.keys())}", file=sys.stderr)
+
+        # 2. Sincronizar simultaneamente quota-dashboard-credentials no namespace quota-dashboard
+        try:
+            req_get = urllib.request.Request(
+                f'https://{host}:{port}/api/v1/namespaces/quota-dashboard/secrets/quota-dashboard-credentials',
+                headers={'Authorization': f'Bearer {sa_token}'}
+            )
+            with urllib.request.urlopen(req_get, context=ctx, timeout=5) as resp_q:
+                q_sec = json.loads(resp_q.read().decode())
+                q_creds_raw = base64.b64decode(q_sec.get('data', {}).get('credentials.json', '')).decode()
+                q_creds = json.loads(q_creds_raw)
+
+                if "ANTHROPIC_OAUTH_TOKEN" in updates:
+                    q_creds.setdefault("anthropic", {})["access"] = updates["ANTHROPIC_OAUTH_TOKEN"]
+                if "ANTHROPIC_REFRESH_TOKEN" in updates:
+                    q_creds.setdefault("anthropic", {})["refresh"] = updates["ANTHROPIC_REFRESH_TOKEN"]
+                if "OPENAI_CODEX_OAUTH_TOKEN" in updates:
+                    q_creds.setdefault("openai-codex", {})["access"] = updates["OPENAI_CODEX_OAUTH_TOKEN"]
+                if "OPENAI_CODEX_REFRESH_TOKEN" in updates:
+                    q_creds.setdefault("openai-codex", {})["refresh"] = updates["OPENAI_CODEX_REFRESH_TOKEN"]
+                if "GOOGLE_ANTIGRAVITY_OAUTH_TOKEN" in updates:
+                    q_creds.setdefault("google-antigravity", {})["access"] = updates["GOOGLE_ANTIGRAVITY_OAUTH_TOKEN"]
+
+                new_q_b64 = base64.b64encode(json.dumps(q_creds, indent=2).encode()).decode()
+                patch_q_body = json.dumps({'data': {'credentials.json': new_q_b64}}).encode()
+                req_patch_q = urllib.request.Request(
+                    f'https://{host}:{port}/api/v1/namespaces/quota-dashboard/secrets/quota-dashboard-credentials',
+                    data=patch_q_body, method='PATCH',
+                    headers={
+                        'Authorization': f'Bearer {sa_token}',
+                        'Content-Type': 'application/strategic-merge-patch+json'
+                    }
+                )
+                urllib.request.urlopen(req_patch_q, context=ctx, timeout=5)
+                print(f"[TokenManager] quota-dashboard-credentials sincronizado atomicamente", file=sys.stderr)
+        except Exception as eq:
+            print(f"[TokenManager] Aviso: falhou sincronizar quota-dashboard-credentials: {eq}", file=sys.stderr)
+
+    except Exception as e:
+        print(f"[TokenManager] Aviso: falhou persistir secret: {e}", file=sys.stderr)
+
+# --- 2. Token Manager com Auto-Refresh em memória ---
+ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+GOOGLE_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+GOOGLE_CLIENT_SECRET = "***REMOVED***"
 
 class TokenManager:
     def __init__(self):
@@ -179,15 +217,16 @@ class TokenManager:
                                 "GOOGLE_ANTIGRAVITY_OAUTH_TOKEN": self._google_token
                             })
                     except Exception as e:
-                        print(f"[TokenManager] Error refreshing Google token: {e}", file=sys.stderr)
+                        print(f"[TokenManager] Erro ao renovar Google token: {e}", file=sys.stderr)
             return self._google_token
 
     def get_google_project_id(self):
         return self._google_project_id
 
 _token_manager = TokenManager()
+_thought_signatures = {}
 
-# --- 3. Wire protocol adapters for Claude Code, OpenAI Codex, and Google Antigravity ---
+# --- 3. Funções auxiliares para Claude Code, OpenAI Codex e Google Antigravity ---
 CLAUDE_CODE_PROMPT = "You are Claude Code, Anthropic's official CLI for Claude."
 
 def _inject_claude_prompt(kwargs, args=None):
@@ -198,7 +237,7 @@ def _inject_claude_prompt(kwargs, args=None):
             kwargs["api_key"] = fresh_anthropic_token
             os.environ["ANTHROPIC_OAUTH_TOKEN"] = fresh_anthropic_token
 
-        # Fix Anthropic extended thinking temperature rule:
+        # Fix Anthropic extended thinking temperature rule
         temp = kwargs.get("temperature")
         if temp is not None and float(temp) != 1.0:
             if kwargs.get("thinking"):
@@ -206,6 +245,11 @@ def _inject_claude_prompt(kwargs, args=None):
             else:
                 kwargs.pop("reasoning_effort", None)
                 kwargs.pop("thinking", None)
+
+        if kwargs.get("thinking"):
+            budget = kwargs["thinking"].get("budget_tokens", 1024) if isinstance(kwargs["thinking"], dict) else 1024
+            if kwargs.get("max_tokens") is not None and kwargs["max_tokens"] <= budget:
+                kwargs["max_tokens"] = budget + 2048
 
         messages = kwargs.get("messages") or (args[1] if args and len(args) > 1 else [])
         if isinstance(messages, list):
@@ -313,7 +357,7 @@ def _tools_to_codex_tools(tools):
                 })
     return codex_tools if codex_tools else None
 
-def _call_codex_sync(model, messages, token, tools=None):
+def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
     url = "https://chatgpt.com/backend-api/codex/responses"
     codex_input = _messages_to_codex_input(messages)
     codex_tools = _tools_to_codex_tools(tools)
@@ -327,7 +371,11 @@ def _call_codex_sync(model, messages, token, tools=None):
     }
     if codex_tools:
         body["tools"] = codex_tools
-    
+        
+    if extra_kwargs:
+        effort = extra_kwargs.get("reasoning_effort")
+        if effort and str(effort).lower() != "none":
+            body["reasoning"] = {"effort": str(effort).lower(), "summary": "auto"}
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -393,7 +441,7 @@ def _call_codex_sync(model, messages, token, tools=None):
 
     return "".join(full_text), tool_calls
 
-async def _stream_codex_generator(model, messages, token, tools=None):
+async def _stream_codex_generator(model, messages, token, tools=None, extra_kwargs=None):
     from litellm import ModelResponse
     url = "https://chatgpt.com/backend-api/codex/responses"
     codex_input = _messages_to_codex_input(messages)
@@ -408,7 +456,11 @@ async def _stream_codex_generator(model, messages, token, tools=None):
     }
     if codex_tools:
         body["tools"] = codex_tools
-    
+        
+    if extra_kwargs:
+        effort = extra_kwargs.get("reasoning_effort")
+        if effort and str(effort).lower() != "none":
+            body["reasoning"] = {"effort": str(effort).lower(), "summary": "auto"}
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -554,33 +606,128 @@ def _map_antigravity_model(model_str):
             return v
     return "gemini-2.5-flash"
 
-def _messages_to_antigravity_payload(model, messages, project_id):
+def _tools_to_antigravity_tools(tools):
+    if not tools:
+        return None
+    decls = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = fn.get("name")
+        if not name or not isinstance(name, str):
+            continue
+        decl = {
+            "name": name,
+            "description": str(fn.get("description") or "")
+        }
+        params = fn.get("parameters")
+        if params and isinstance(params, dict):
+            decl["parametersJsonSchema"] = params
+        decls.append(decl)
+    return [{"functionDeclarations": decls}] if decls else None
+
+def _messages_to_antigravity_payload(model, messages, project_id, tools=None, extra_kwargs=None):
     mapped_model = _map_antigravity_model(model)
     contents = []
     system_parts = []
+    tool_names = {}
+    for m in messages:
+        if m.get("tool_calls"):
+            for tc in m.get("tool_calls", []):
+                tid = tc.get("id") or ""
+                tname = (tc.get("function") or {}).get("name") or ""
+                if tid:
+                    tool_names[tid] = tname
+
     for m in messages:
         role = m.get("role", "user")
-        content = m.get("content", "")
+        content = m.get("content")
+        
+        if role == "tool":
+            tool_call_id = m.get("tool_call_id") or ""
+            fn_name = m.get("name") or tool_names.get(tool_call_id) or "tool"
+            text_out = str(content) if not isinstance(content, list) else "".join(
+                p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ["text", "input_text"]
+            )
+            try:
+                resp_json = json.loads(text_out)
+                if not isinstance(resp_json, dict):
+                    resp_json = {"result": resp_json}
+            except:
+                resp_json = {"result": text_out}
+            contents.append({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": fn_name,
+                        "response": resp_json
+                    }
+                }]
+            })
+            continue
+
         if isinstance(content, list):
-            text_parts = []
-            for part in content:
-                if isinstance(part, dict):
-                    if part.get("type") in ["text", "input_text"]:
-                        text_parts.append(part.get("text", ""))
+            text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ["text", "input_text", "output_text"]]
             text = "".join(text_parts)
         else:
-            text = str(content)
+            text = str(content) if content is not None else ""
 
         if role == "system":
-            system_parts.append({"text": text})
+            if text:
+                system_parts.append({"text": text})
         elif role == "assistant":
-            contents.append({"role": "model", "parts": [{"text": text}]})
+            parts = []
+            if text:
+                parts.append({"text": text})
+            if m.get("tool_calls"):
+                for tc in m.get("tool_calls", []):
+                    func = tc.get("function") or {}
+                    fn_name = func.get("name") or ""
+                    fn_args = func.get("arguments") or {}
+                    if isinstance(fn_args, str):
+                        try:
+                            fn_args = json.loads(fn_args)
+                        except:
+                            fn_args = {"__raw": fn_args}
+                    
+                    tc_id = tc.get("id") or ""
+                    tsig = tc.get("thoughtSignature") or tc.get("thought_signature") or (tc_id.split("|")[1] if "|" in tc_id else None) or _thought_signatures.get(tc_id) or "skip_thought_signature_validator"
+                    fc_part = {
+                        "functionCall": {
+                            "name": fn_name,
+                            "args": fn_args
+                        },
+                        "thoughtSignature": tsig
+                    }
+                    parts.append(fc_part)
+            if parts:
+                contents.append({"role": "model", "parts": parts})
         else:
-            contents.append({"role": "user", "parts": [{"text": text}]})
+            if text:
+                contents.append({"role": "user", "parts": [{"text": text}]})
 
-    request_obj = {"contents": contents}
+    gen_config = {"maxOutputTokens": 64000}
+    if "thinking" in str(model).lower():
+        gen_config["thinkingConfig"] = {"includeThoughts": True}
+        
+    request_obj = {
+        "contents": contents,
+        "generationConfig": gen_config,
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}
+        ]
+    }
     if system_parts:
         request_obj["systemInstruction"] = {"parts": system_parts}
+
+    antigravity_tools = _tools_to_antigravity_tools(tools)
+    if antigravity_tools:
+        request_obj["tools"] = antigravity_tools
+        request_obj["toolConfig"] = {"functionCallingConfig": {"mode": "VALIDATED"}}
 
     return {
         "project": project_id,
@@ -591,43 +738,46 @@ def _messages_to_antigravity_payload(model, messages, project_id):
         "request": request_obj
     }
 
-def _call_antigravity_sync(model, messages, token, project_id):
+def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra_kwargs=None):
     url = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
-    payload = _messages_to_antigravity_payload(model, messages, project_id)
+    payload = _messages_to_antigravity_payload(model, messages, project_id, tools=tools, extra_kwargs=extra_kwargs)
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
         "User-Agent": "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
     }
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
     
     full_text = []
+    tool_calls = []
     prompt_tokens = 10
     completion_tokens = 10
-    try:
-        resp_handle = urllib.request.urlopen(req, timeout=45)
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
+
+    with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+        resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
+        if resp.status_code == 401:
+            resp.close()
             fresh_token = _token_manager.get_google_token(force_refresh=True)
             if fresh_token:
                 headers["Authorization"] = f"Bearer {fresh_token}"
-                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
-                resp_handle = urllib.request.urlopen(req, timeout=45)
+                resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
             else:
-                raise
-        elif e.code in [503, 404] and payload.get("model") != "gemini-3.7-flash-low":
-            payload["model"] = "gemini-3.7-flash-low"
-            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
-            resp_handle = urllib.request.urlopen(req, timeout=45)
-        else:
-            raise
+                resp.raise_for_status()
 
-    with resp_handle as resp:
-        for line in resp:
-            line_str = line.decode("utf-8", "replace").strip()
+        if resp.status_code in [503, 404] and payload.get("model") != "gemini-3.7-flash-low":
+            resp.close()
+            payload["model"] = "gemini-3.7-flash-low"
+            resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
+
+        if resp.status_code != 200:
+            err_text = resp.read().decode("utf-8", "replace")
+            resp.close()
+            raise Exception(f"Google Antigravity error {resp.status_code}: {err_text}")
+
+        for line in resp.iter_lines():
+            line_str = line.strip()
             if line_str.startswith("data: "):
-                data_str = line_str[6:]
+                data_str = line_str[6:].strip()
                 if data_str == "[DONE]":
                     break
                 try:
@@ -640,96 +790,152 @@ def _call_antigravity_sync(model, messages, token, project_id):
                             txt = p.get("text", "")
                             if txt:
                                 full_text.append(txt)
+                            fc = p.get("functionCall")
+                            if fc:
+                                tsig = p.get("thoughtSignature")
+                                call_id = fc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                                if tsig:
+                                    _thought_signatures[call_id] = tsig
+                                fn_name = fc.get("name", "")
+                                fn_args = json.dumps(fc.get("args") or {})
+                                tool_calls.append({
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": fn_name, "arguments": fn_args}
+                                })
                     usage = resp_obj.get("usageMetadata", {})
                     if usage:
                         prompt_tokens = usage.get("promptTokenCount", prompt_tokens)
                         completion_tokens = usage.get("candidatesTokenCount", completion_tokens)
                 except:
                     pass
-    return "".join(full_text), prompt_tokens, completion_tokens
+        resp.close()
 
-async def _stream_antigravity_generator(model, messages, token, project_id):
+    return "".join(full_text), tool_calls, prompt_tokens, completion_tokens
+
+async def _stream_antigravity_generator(model, messages, token, project_id, tools=None, extra_kwargs=None):
     from litellm import ModelResponse
     url = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
-    payload = _messages_to_antigravity_payload(model, messages, project_id)
+    payload = _messages_to_antigravity_payload(model, messages, project_id, tools=tools, extra_kwargs=extra_kwargs)
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
         "User-Agent": "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
     }
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
-    
+
     resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
-    loop = asyncio.get_event_loop()
-    queue = asyncio.Queue()
-    
-    def run_request():
-        try:
-            req_obj = req
-            try:
-                r_handle = urllib.request.urlopen(req_obj, timeout=45)
-            except urllib.error.HTTPError as e:
-                if e.code == 401:
-                    fresh_token = _token_manager.get_google_token(force_refresh=True)
-                    if fresh_token:
-                        headers["Authorization"] = f"Bearer {fresh_token}"
-                        req_obj = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
-                        r_handle = urllib.request.urlopen(req_obj, timeout=45)
-                    else:
-                        raise
-                elif e.code in [503, 404] and payload.get("model") != "gemini-3.7-flash-low":
-                    payload["model"] = "gemini-3.7-flash-low"
-                    req_obj = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
-                    r_handle = urllib.request.urlopen(req_obj, timeout=45)
-                else:
-                    raise
+    current_tool_index = 0
+    has_tool_calls = False
 
-            with r_handle as r:
-                for line in r:
-                    line_str = line.decode("utf-8", "replace").strip()
-                    if line_str.startswith("data: "):
-                        data_str = line_str[6:]
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(data_str)
-                            resp_obj = event.get("response", {})
-                            candidates = resp_obj.get("candidates", [])
-                            if candidates:
-                                parts = candidates[0].get("content", {}).get("parts", [])
-                                for p in parts:
-                                    txt = p.get("text", "")
-                                    if txt:
-                                        loop.call_soon_threadsafe(queue.put_nowait, txt)
-                        except:
-                            pass
-        except Exception as e:
-            print(f"[sitecustomize] Antigravity stream erro: {e}", file=sys.stderr)
-        finally:
-            loop.call_soon_threadsafe(queue.put_nowait, None)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+        resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
+        if resp.status_code == 401:
+            await resp.aclose()
+            fresh_token = _token_manager.get_google_token(force_refresh=True)
+            if fresh_token:
+                headers["Authorization"] = f"Bearer {fresh_token}"
+                resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
+            else:
+                resp.raise_for_status()
 
-    threading.Thread(target=run_request, daemon=True).start()
+        if resp.status_code in [503, 404] and payload.get("model") != "gemini-3.7-flash-low":
+            await resp.aclose()
+            payload["model"] = "gemini-3.7-flash-low"
+            resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
 
-    while True:
-        delta = await queue.get()
-        if delta is None:
-            break
-        yield ModelResponse(
-            id=resp_id,
-            object="chat.completion.chunk",
-            created=created,
-            model=model,
-            choices=[{"index": 0, "delta": {"content": delta}, "finish_reason": None}]
-        )
-    
+        if resp.status_code != 200:
+            err_text = (await resp.aread()).decode("utf-8", "replace")
+            await resp.aclose()
+            raise Exception(f"Google Antigravity error {resp.status_code}: {err_text}")
+
+        async for line in resp.aiter_lines():
+            line_str = line.strip()
+            if line_str.startswith("data: "):
+                data_str = line_str[6:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data_str)
+                    resp_obj = event.get("response", {})
+                    candidates = resp_obj.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        for p in parts:
+                            txt = p.get("text", "")
+                            if txt:
+                                yield ModelResponse(
+                                    id=resp_id,
+                                    object="chat.completion.chunk",
+                                    created=created,
+                                    model=model,
+                                    choices=[{"index": 0, "delta": {"content": txt}, "finish_reason": None}]
+                                )
+                            fc = p.get("functionCall")
+                            if fc:
+                                has_tool_calls = True
+                                tsig = p.get("thoughtSignature")
+                                call_id = fc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                                if tsig:
+                                    _thought_signatures[call_id] = tsig
+                                fn_name = fc.get("name", "")
+                                fn_args = json.dumps(fc.get("args") or {})
+                                
+                                # Chunk 1: Tool call start
+                                yield ModelResponse(
+                                    id=resp_id,
+                                    object="chat.completion.chunk",
+                                    created=created,
+                                    model=model,
+                                    choices=[{
+                                        "index": 0,
+                                        "delta": {
+                                            "role": "assistant",
+                                            "tool_calls": [{
+                                                "index": current_tool_index,
+                                                "id": call_id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": fn_name,
+                                                    "arguments": ""
+                                                }
+                                            }]
+                                        },
+                                        "finish_reason": None
+                                    }]
+                                )
+                                # Chunk 2: Tool call arguments
+                                yield ModelResponse(
+                                    id=resp_id,
+                                    object="chat.completion.chunk",
+                                    created=created,
+                                    model=model,
+                                    choices=[{
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [{
+                                                "index": current_tool_index,
+                                                "function": {
+                                                    "arguments": fn_args
+                                                }
+                                            }]
+                                        },
+                                        "finish_reason": None
+                                    }]
+                                )
+                                current_tool_index += 1
+                except:
+                    pass
+        await resp.aclose()
+
+    finish_reason = "tool_calls" if has_tool_calls else "stop"
     yield ModelResponse(
         id=resp_id,
         object="chat.completion.chunk",
         created=created,
         model=model,
-        choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        choices=[{"index": 0, "delta": {}, "finish_reason": finish_reason}]
     )
 
 # --- 4. Monkey-patch litellm.acompletion e litellm.completion ---
@@ -747,30 +953,40 @@ try:
             google_token = _token_manager.get_google_token()
             google_project = _token_manager.get_google_project_id()
             if google_token:
+                tools = kwargs.get("tools")
                 if kwargs.get("stream", False):
-                    return _stream_antigravity_generator(model, messages, google_token, google_project)
+                    return _stream_antigravity_generator(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs)
                 else:
                     loop = asyncio.get_event_loop()
-                    content, pt, ct = await loop.run_in_executor(None, _call_antigravity_sync, model, messages, google_token, google_project)
+                    content, tool_calls, pt, ct = await loop.run_in_executor(None, _call_antigravity_sync, model, messages, google_token, google_project, tools, kwargs)
                     from litellm import ModelResponse
+                    msg = {"role": "assistant"}
+                    if tool_calls:
+                        msg["tool_calls"] = tool_calls
+                        finish_reason = "tool_calls"
+                    else:
+                        msg["content"] = content
+                        finish_reason = "stop"
                     return ModelResponse(
                         id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
                         object="chat.completion",
                         created=int(time.time()),
                         model=model,
-                        choices=[{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+                        choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
                         usage={"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
                     )
 
         # OpenAI Codex Bridge
-        codex_token = _token_manager.get_codex_token()
-        if codex_token and _is_codex_model(model):
+        if _is_codex_model(model):
+            codex_token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
+            if not codex_token:
+                raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
             tools = kwargs.get("tools")
             if kwargs.get("stream", False):
-                return _stream_codex_generator(model, messages, codex_token, tools=tools)
+                return _stream_codex_generator(model, messages, codex_token, tools=tools, extra_kwargs=kwargs)
             else:
                 loop = asyncio.get_event_loop()
-                content, tool_calls = await loop.run_in_executor(None, _call_codex_sync, model, messages, codex_token, tools)
+                content, tool_calls = await loop.run_in_executor(None, _call_codex_sync, model, messages, codex_token, tools, kwargs)
                 from litellm import ModelResponse
                 msg = {"role": "assistant"}
                 if tool_calls:
@@ -805,22 +1021,32 @@ try:
             google_token = _token_manager.get_google_token()
             google_project = _token_manager.get_google_project_id()
             if google_token:
-                content, pt, ct = _call_antigravity_sync(model, messages, google_token, google_project)
+                tools = kwargs.get("tools")
+                content, tool_calls, pt, ct = _call_antigravity_sync(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs)
                 from litellm import ModelResponse
+                msg = {"role": "assistant"}
+                if tool_calls:
+                    msg["tool_calls"] = tool_calls
+                    finish_reason = "tool_calls"
+                else:
+                    msg["content"] = content
+                    finish_reason = "stop"
                 return ModelResponse(
                     id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
                     object="chat.completion",
                     created=int(time.time()),
                     model=model,
-                    choices=[{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+                    choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
                     usage={"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
                 )
 
         # OpenAI Codex Bridge
-        codex_token = _token_manager.get_codex_token()
-        if codex_token and _is_codex_model(model):
+        if _is_codex_model(model):
+            codex_token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
+            if not codex_token:
+                raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
             tools = kwargs.get("tools")
-            content, tool_calls = _call_codex_sync(model, messages, codex_token, tools=tools)
+            content, tool_calls = _call_codex_sync(model, messages, codex_token, tools=tools, extra_kwargs=kwargs)
             from litellm import ModelResponse
             msg = {"role": "assistant"}
             if tool_calls:
@@ -843,6 +1069,6 @@ try:
     if hasattr(litellm, "main"):
         litellm.main.completion = _wrapped_completion
 
-    print("[sitecustomize] LiteLLM Claude Code + OpenAI Codex + Google Antigravity with Auto-Refresh enabled", file=sys.stderr)
+    print("[sitecustomize] litellm Claude Code + OpenAI Codex + Google Antigravity com Auto-Refresh ativado", file=sys.stderr)
 except Exception as _e:
-    print(f"[sitecustomize] Error loading bridges in LiteLLM: {_e}", file=sys.stderr)
+    print(f"[sitecustomize] Erro ao carregar bridges no litellm: {_e}", file=sys.stderr)
