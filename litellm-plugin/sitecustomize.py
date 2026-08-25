@@ -45,21 +45,31 @@ try:
 except Exception as _e:
     print(f"[sitecustomize] litellm mcp patch ignorado: {_e}", file=sys.stderr)
 
-# --- helper: persiste tokens atomicamente em litellm-secrets E quota-dashboard-credentials ---
+# --- helper: atomically persist tokens across Kubernetes Secrets ---
+LITELLM_NAMESPACE = os.environ.get("LITELLM_NAMESPACE", "litellm")
+LITELLM_SECRET_NAME = os.environ.get("LITELLM_SECRET_NAME", "litellm-secrets")
+QUOTA_DASHBOARD_NAMESPACE = os.environ.get("QUOTA_DASHBOARD_NAMESPACE", "quota-dashboard")
+QUOTA_DASHBOARD_SECRET_NAME = os.environ.get("QUOTA_DASHBOARD_SECRET_NAME", "quota-dashboard-credentials")
+
 def _persist_tokens_to_secret(updates: dict):
     try:
-        sa_token = open('/var/run/secrets/kubernetes.io/serviceaccount/token').read()
-        ca = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+        sa_token_path = '/var/run/secrets/kubernetes.io/serviceaccount/token'
+        ca_path = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+        if not os.path.exists(sa_token_path) or not os.path.exists(ca_path):
+            return
+
+        sa_token = open(sa_token_path).read()
+        ca = ca_path
         host = os.environ.get('KUBERNETES_SERVICE_HOST', 'kubernetes.default.svc')
         port = os.environ.get('KUBERNETES_SERVICE_PORT', '443')
         ctx = ssl.create_default_context(cafile=ca)
 
-        # 1. Atualizar litellm-secrets no namespace litellm
+        # 1. Update litellm-secrets
         patch = {k: base64.b64encode(v.encode()).decode() for k, v in updates.items() if v}
         if patch:
             body = json.dumps({'data': patch}).encode()
             req = urllib.request.Request(
-                f'https://{host}:{port}/api/v1/namespaces/litellm/secrets/litellm-secrets',
+                f'https://{host}:{port}/api/v1/namespaces/{LITELLM_NAMESPACE}/secrets/{LITELLM_SECRET_NAME}',
                 data=body, method='PATCH',
                 headers={
                     'Authorization': f'Bearer {sa_token}',
@@ -67,12 +77,12 @@ def _persist_tokens_to_secret(updates: dict):
                 }
             )
             urllib.request.urlopen(req, context=ctx, timeout=5)
-            print(f"[TokenManager] litellm-secrets persistido: {list(updates.keys())}", file=sys.stderr)
+            print(f"[TokenManager] {LITELLM_SECRET_NAME} persisted: {list(updates.keys())}", file=sys.stderr)
 
-        # 2. Sincronizar simultaneamente quota-dashboard-credentials no namespace quota-dashboard
+        # 2. Synchronize quota-dashboard-credentials if present
         try:
             req_get = urllib.request.Request(
-                f'https://{host}:{port}/api/v1/namespaces/quota-dashboard/secrets/quota-dashboard-credentials',
+                f'https://{host}:{port}/api/v1/namespaces/{QUOTA_DASHBOARD_NAMESPACE}/secrets/{QUOTA_DASHBOARD_SECRET_NAME}',
                 headers={'Authorization': f'Bearer {sa_token}'}
             )
             with urllib.request.urlopen(req_get, context=ctx, timeout=5) as resp_q:
@@ -94,7 +104,7 @@ def _persist_tokens_to_secret(updates: dict):
                 new_q_b64 = base64.b64encode(json.dumps(q_creds, indent=2).encode()).decode()
                 patch_q_body = json.dumps({'data': {'credentials.json': new_q_b64}}).encode()
                 req_patch_q = urllib.request.Request(
-                    f'https://{host}:{port}/api/v1/namespaces/quota-dashboard/secrets/quota-dashboard-credentials',
+                    f'https://{host}:{port}/api/v1/namespaces/{QUOTA_DASHBOARD_NAMESPACE}/secrets/{QUOTA_DASHBOARD_SECRET_NAME}',
                     data=patch_q_body, method='PATCH',
                     headers={
                         'Authorization': f'Bearer {sa_token}',
@@ -102,18 +112,18 @@ def _persist_tokens_to_secret(updates: dict):
                     }
                 )
                 urllib.request.urlopen(req_patch_q, context=ctx, timeout=5)
-                print(f"[TokenManager] quota-dashboard-credentials sincronizado atomicamente", file=sys.stderr)
+                print(f"[TokenManager] {QUOTA_DASHBOARD_SECRET_NAME} synchronized atomically", file=sys.stderr)
         except Exception as eq:
-            print(f"[TokenManager] Aviso: falhou sincronizar quota-dashboard-credentials: {eq}", file=sys.stderr)
+            print(f"[TokenManager] Notice: failed to sync {QUOTA_DASHBOARD_SECRET_NAME}: {eq}", file=sys.stderr)
 
     except Exception as e:
-        print(f"[TokenManager] Aviso: falhou persistir secret: {e}", file=sys.stderr)
+        print(f"[TokenManager] Notice: failed to persist secret: {e}", file=sys.stderr)
 
-# --- 2. Token Manager com Auto-Refresh em memória ---
-ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-GOOGLE_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-GOOGLE_CLIENT_SECRET = "***REMOVED***"
+# --- 2. In-Memory Token Manager with Auto-Refresh ---
+ANTHROPIC_CLIENT_ID = os.environ.get("ANTHROPIC_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+CODEX_CLIENT_ID = os.environ.get("CODEX_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "***REMOVED***")
 
 class TokenManager:
     def __init__(self):
