@@ -717,31 +717,14 @@ export async function fetchAllUsage(forceRefresh = false): Promise<UsageReport[]
 					reportCache.set(providerId, { report: { ...report }, expiresAt: now + CACHE_TTL_MS });
 				}
 			} catch (error) {
-				// Fallback: previous snapshot preserving last known limits
+				// Fallback: the previous snapshot, which holds numbers the provider
+				// actually returned. With no snapshot there is nothing honest to
+				// show, so this falls through to the error path below. Inventing a
+				// value here would be worse than failing: an unreachable provider
+				// would render as healthy and the real quota would only surface
+				// once requests started coming back 429.
 				if (cached && cached.report.limits.length > 0) {
 					return staleReport(cached.report, error);
-				}
-				if (providerId === "anthropic") {
-					const fallbackAnthropicLimits: UsageLimit[] = [
-						{
-							id: "anthropic:session",
-							label: "Claude 5 Hour",
-							usedFraction: 0.02,
-							resetsAt: Date.now() + 2 * 3600 * 1000,
-						},
-						{
-							id: "anthropic:weekly_all",
-							label: "Claude 7 Day",
-							usedFraction: 0.51,
-							resetsAt: Date.now() + 5 * 86400 * 1000,
-						},
-					];
-					return {
-						...report,
-						limits: fallbackAnthropicLimits,
-						cached: true,
-						plan: stored.plan || "claude-max",
-					};
 				}
 				const msg = error instanceof Error ? error.message : String(error);
 				if (msg === "RATE_LIMITED_429" || msg === "COOLDOWN_ACTIVE") {
