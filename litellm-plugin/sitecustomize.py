@@ -241,6 +241,66 @@ _thought_signatures = {}
 # Anthropic OAuth validates this exact Agent SDK identity as the sole system message.
 CLAUDE_CODE_PROMPT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 
+# Anthropic allows at most 4 cache breakpoints and caches everything *up to*
+# each one. Marking only the static prefix leaves the conversation uncached, so
+# a long agent turn re-reads its whole history at full price.
+ANTHROPIC_MAX_CACHE_BREAKPOINTS = 4
+
+def _is_cacheable_text_message(message):
+    """True when a breakpoint can be attached without touching structured payloads.
+
+    tool_calls and tool results carry schemas Anthropic validates; injecting a
+    marker into them corrupts the request, so they are never candidates.
+    """
+    if not isinstance(message, dict):
+        return False
+    if message.get("role") not in ("user", "assistant"):
+        return False
+    if message.get("tool_calls") or message.get("tool_call_id"):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and str(block.get("text", "")).strip()
+            for block in content
+        )
+    return False
+
+def _count_cache_breakpoints(messages):
+    total = 0
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            total += sum(
+                1 for block in content
+                if isinstance(block, dict) and block.get("cache_control")
+            )
+    return total
+
+def _mark_cache_breakpoint(message, ttl=None):
+    """Attach an ephemeral breakpoint to the message's last text block."""
+    control = {"type": "ephemeral"}
+    if ttl:
+        control["ttl"] = ttl
+    content = message.get("content")
+    if isinstance(content, str):
+        message["content"] = [{"type": "text", "text": content, "cache_control": control}]
+        return True
+    if isinstance(content, list):
+        for block in reversed(content):
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and str(block.get("text", "")).strip()
+            ):
+                block["cache_control"] = control
+                return True
+    return False
+
 def _inject_claude_prompt(kwargs, args=None):
     model = str(kwargs.get("model", "") or (args[0] if args and len(args) > 0 else "")).lower()
     if "claude" not in model and "anthropic" not in model:
@@ -331,6 +391,7 @@ def _inject_claude_prompt(kwargs, args=None):
         "content": [{"type": "text", "text": CLAUDE_CODE_PROMPT}],
     }
 
+    static_index = None
     if client_system_prompt:
         cached_instructions = {
             "type": "text",
@@ -339,7 +400,10 @@ def _inject_claude_prompt(kwargs, args=None):
                 f"{client_system_prompt}\n"
                 "</client_system_instructions>"
             ),
-            "cache_control": {"type": "ephemeral"},
+            # Static prefix: rarely written, read every turn, so the long TTL
+            # pays for itself. The rolling tail below keeps the 5m default
+            # because it is rewritten each turn (1h writes cost 2x vs 1.25x).
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
         }
         first_user_index = next(
             (
@@ -351,6 +415,7 @@ def _inject_claude_prompt(kwargs, args=None):
         )
         if first_user_index is None:
             non_system_messages.insert(0, {"role": "user", "content": [cached_instructions]})
+            static_index = 0
         else:
             first_user = dict(non_system_messages[first_user_index])
             user_content = first_user.get("content", "")
@@ -362,6 +427,32 @@ def _inject_claude_prompt(kwargs, args=None):
                     {"type": "text", "text": str(user_content)},
                 ]
             non_system_messages[first_user_index] = first_user
+            static_index = first_user_index
+
+    # Rolling breakpoint on the newest safe text block: without it Anthropic
+    # caches only the static prefix and every turn re-reads the whole grown
+    # conversation at full price.
+    tail_index = next(
+        (
+            index
+            for index in range(len(non_system_messages) - 1, -1, -1)
+            if _is_cacheable_text_message(non_system_messages[index])
+        ),
+        None,
+    )
+    if (
+        tail_index is not None
+        and tail_index != static_index
+        and _count_cache_breakpoints(non_system_messages) < ANTHROPIC_MAX_CACHE_BREAKPOINTS
+    ):
+        tail = dict(non_system_messages[tail_index])
+        if isinstance(tail.get("content"), list):
+            tail["content"] = [
+                dict(block) if isinstance(block, dict) else block
+                for block in tail["content"]
+            ]
+        if _mark_cache_breakpoint(tail):
+            non_system_messages[tail_index] = tail
 
     kwargs["messages"] = [claude_identity] + non_system_messages
     return kwargs
