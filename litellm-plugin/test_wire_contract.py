@@ -63,3 +63,29 @@ response_turn = request["contents"][1]
 responses = [part["functionResponse"] for part in response_turn["parts"]]
 assert len(responses) == 2 and responses[0]["id"] == "call-a" and responses[1]["response"] == {"error": "bad"}
 print("Codex and Antigravity wire contracts OK")
+
+# Captured OMP CLI wire payloads (/tmp/omp-req-{codex,gemini}.json) carry
+# max_completion_tokens, never max_tokens. Both bridges must honour that
+# spelling or the client's output ceiling is silently ignored.
+omp_extra = {"reasoning_effort": "high", "max_completion_tokens": 8192, "store": False}
+
+omp_codex = namespace["_codex_request_body"](
+    "gpt-5.6-terra",
+    [{"role": "user", "content": "ping"}],
+    None,
+    dict(omp_extra),
+)
+assert "max_output_tokens" not in omp_codex
+assert "max_completion_tokens" not in omp_codex
+assert "max_tokens" not in omp_codex
+assert omp_codex["reasoning"]["effort"] == "high"
+
+omp_gemini = namespace["_messages_to_antigravity_payload"](
+    "gemini-3.7-flash",
+    [{"role": "user", "content": "ping"}],
+    "project",
+    None,
+    dict(omp_extra),
+)
+assert omp_gemini["request"]["generationConfig"]["maxOutputTokens"] == 8192
+print("OMP-shaped max_completion_tokens parity OK (Codex + Antigravity)")

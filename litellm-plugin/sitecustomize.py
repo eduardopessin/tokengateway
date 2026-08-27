@@ -877,7 +877,10 @@ def _messages_to_antigravity_payload(model, messages, project_id, tools=None, ex
             contents.append({"role": "user", "parts": parts})
     flush_tool_responses()
 
-    max_tokens = (extra_kwargs or {}).get("max_tokens") or 64000
+    # OMP sends max_completion_tokens (OpenAI-style); accept both spellings or
+    # the client's requested output ceiling is silently replaced by the default.
+    _extra = extra_kwargs or {}
+    max_tokens = _extra.get("max_tokens") or _extra.get("max_completion_tokens") or 64000
     request_obj = {"contents": contents, "generationConfig": {"maxOutputTokens": max_tokens}}
     if "thinking" in model.lower():
         request_obj["generationConfig"]["thinkingConfig"] = {"includeThoughts": True}
