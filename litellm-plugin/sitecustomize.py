@@ -130,10 +130,11 @@ class TokenManager:
         self._google_token = os.environ.get("GOOGLE_ANTIGRAVITY_OAUTH_TOKEN", "")
         self._google_refresh = os.environ.get("GOOGLE_ANTIGRAVITY_REFRESH_TOKEN", "")
         self._google_project_id = os.environ.get("GOOGLE_ANTIGRAVITY_PROJECT_ID", "")
+        now_init = time.time()
         self._last_refresh = {
-            "anthropic": 0,
-            "codex": 0,
-            "google": 0
+            "anthropic": now_init,
+            "codex": now_init,
+            "google": now_init
         }
 
     def get_anthropic_token(self, force_refresh=False):
