@@ -490,6 +490,13 @@ def _codex_tool_choice(choice):
         return {"type": "function", "name": function["name"]}
     return choice
 
+def _strip_codex_output_limits(kwargs):
+    for key in ("max_tokens", "max_output_tokens", "max_completion_tokens"):
+        kwargs.pop(key, None)
+    if isinstance(kwargs.get("extra_body"), dict):
+        for key in ("max_tokens", "max_output_tokens", "max_completion_tokens"):
+            kwargs["extra_body"].pop(key, None)
+
 def _codex_request_body(model, messages, tools, extra_kwargs):
     body = {
         "model": model.split("/")[-1],
@@ -1119,10 +1126,7 @@ try:
 
         # OpenAI Codex Bridge
         if _is_codex_model(model):
-            # ChatGPT subscription Responses rejects LiteLLM output ceilings.
-            kwargs.pop("max_tokens", None)
-            kwargs.pop("max_output_tokens", None)
-            kwargs.pop("max_completion_tokens", None)
+            _strip_codex_output_limits(kwargs)
             codex_token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
             if not codex_token:
                 raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
@@ -1186,10 +1190,7 @@ try:
 
         # OpenAI Codex Bridge
         if _is_codex_model(model):
-            # ChatGPT subscription Responses rejects LiteLLM output ceilings.
-            kwargs.pop("max_tokens", None)
-            kwargs.pop("max_output_tokens", None)
-            kwargs.pop("max_completion_tokens", None)
+            _strip_codex_output_limits(kwargs)
             codex_token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
             if not codex_token:
                 raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
@@ -1230,6 +1231,8 @@ try:
                     model = str(data.get("model", "")).lower()
                     if "claude" in model or "anthropic" in model:
                         _inject_claude_prompt(data)
+                    elif _is_codex_model(model):
+                        _strip_codex_output_limits(data)
                 except Exception as e:
                     print(f"[AnthropicCacheHandler] Erro no hook: {e}", file=sys.stderr)
                 return data
