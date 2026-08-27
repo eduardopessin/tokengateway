@@ -1252,6 +1252,21 @@ try:
     litellm.Router.completion = _wrapped_router_completion
 
 
+    # Proxy preprocessing can inject max_output_tokens after Router receives the
+    # original kwargs. Strip it at route_request, the final shared boundary.
+    import litellm.proxy.route_llm_request as _route_module
+    _orig_route_request = _route_module.route_request
+    async def _wrapped_route_request(data, *args, **kwargs):
+        if _is_codex_model(str(data.get("model", ""))):
+            _strip_codex_output_limits(data)
+        return await _orig_route_request(data, *args, **kwargs)
+    _route_module.route_request = _wrapped_route_request
+    try:
+        import litellm.proxy.common_request_processing as _common_processing
+        _common_processing.route_request = _wrapped_route_request
+    except Exception as _route_patch_error:
+        print(f"[sitecustomize] route_request patch ignored: {_route_patch_error}", file=sys.stderr)
+
     # Atribuir nos módulos principais do litellm
     litellm.acompletion = _wrapped_acompletion
     litellm.main.acompletion = _wrapped_acompletion
