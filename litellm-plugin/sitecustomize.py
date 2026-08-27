@@ -115,10 +115,10 @@ def _persist_tokens_to_secret(updates: dict):
         print(f"[TokenManager] Aviso: falhou persistir secret: {e}", file=sys.stderr)
 
 # --- 2. Token Manager com Auto-Refresh em memória ---
-ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-GOOGLE_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-GOOGLE_CLIENT_SECRET = "***REMOVED***"
+ANTHROPIC_CLIENT_ID = os.environ.get("ANTHROPIC_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+CODEX_CLIENT_ID = os.environ.get("OPENAI_CODEX_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
 class TokenManager:
     def __init__(self):
