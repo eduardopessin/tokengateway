@@ -181,6 +181,8 @@ This project is a personal homelab tool, not production hardened. The following 
 | TG-009 | 🟡 Medium | `desktop/src-tauri/src/lib.rs` | Tauri `open_url` command passes arbitrary URLs to the OS browser opener without validating the scheme (`file://`, `javascript:` accepted). |
 | TG-010 | 🟡 Medium | `litellm-plugin/sitecustomize.py` | Refreshed OAuth tokens are written back to `os.environ`, exposing them via `/proc/self/environ` to co-tenant processes. |
 | TG-011 | 🔵 Low | `desktop/src-tauri/src/oauth.rs` | Google OAuth token exchange does not validate the `state` parameter (CSRF). Anthropic and OpenAI exchanges do. |
+| TG-012 | 🟠 High → ✅ Fixed | `litellm-plugin/sitecustomize.py` | `GOOGLE_CLIENT_SECRET` was hardcoded in source and present throughout git history. Now read from the `GOOGLE_CLIENT_SECRET` env var (empty default). History was rewritten to purge the value; **if the secret was project-owned it should still be rotated**, since force-push does not un-expose an already-public value. |
+| TG-013 | 🟡 Medium | `desktop/src-tauri/Cargo.lock` | `glib` 0.18.5 (transitive via Tauri 2's gtk-rs 0.18 stack) is affected by GHSA-wrw7-89jp-8q8g (unsoundness in `VariantStrIter` iterators). No isolated fix: the patched 0.20.0 requires migrating the whole gtk-rs line, which stable Tauri 2 does not yet support. The unsound path is not exercised by this app; accepted as tolerable risk until Tauri bumps its GTK bindings. |
 
 **TG-001 is the most immediately exploitable** — no prerequisites, single HTTP request. If you deploy this outside a trusted single-machine environment, add at minimum a shared-secret header check on all `/api/*` routes and bind the dashboard to `127.0.0.1`.
 
