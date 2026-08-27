@@ -1119,6 +1119,10 @@ try:
 
         # OpenAI Codex Bridge
         if _is_codex_model(model):
+            # ChatGPT subscription Responses rejects LiteLLM output ceilings.
+            kwargs.pop("max_tokens", None)
+            kwargs.pop("max_output_tokens", None)
+            kwargs.pop("max_completion_tokens", None)
             codex_token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
             if not codex_token:
                 raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
@@ -1182,6 +1186,10 @@ try:
 
         # OpenAI Codex Bridge
         if _is_codex_model(model):
+            # ChatGPT subscription Responses rejects LiteLLM output ceilings.
+            kwargs.pop("max_tokens", None)
+            kwargs.pop("max_output_tokens", None)
+            kwargs.pop("max_completion_tokens", None)
             codex_token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
             if not codex_token:
                 raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
