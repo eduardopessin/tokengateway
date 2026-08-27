@@ -1212,6 +1212,45 @@ try:
                 usage={"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
             )
         return _orig_completion(*args, **_inject_claude_prompt(kwargs, args))
+    # Proxy routes through Router.acompletion/completion, not necessarily the
+    # module functions above. Intercept both paths before LiteLLM translates
+    # OpenAI max_tokens into the unsupported Responses max_output_tokens.
+    _orig_router_acompletion = litellm.Router.acompletion
+    async def _wrapped_router_acompletion(self, model, messages, stream=False, **kwargs):
+        if _is_gemini_model(model):
+            token = _token_manager.get_google_token()
+            if token:
+                project = _token_manager.get_google_project_id()
+                if stream:
+                    return _stream_antigravity_generator(model, messages, token, project, tools=kwargs.get("tools"), extra_kwargs=kwargs)
+                content, tool_calls, prompt_tokens, completion_tokens = await asyncio.get_event_loop().run_in_executor(
+                    None, _call_antigravity_sync, model, messages, token, project, kwargs.get("tools"), kwargs
+                )
+                message = {"role": "assistant", **({"tool_calls": tool_calls} if tool_calls else {"content": content})}
+                return ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens})
+        if _is_codex_model(model):
+            _strip_codex_output_limits(kwargs)
+            token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
+            if not token:
+                raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
+            if stream:
+                return _stream_codex_generator(model, messages, token, tools=kwargs.get("tools"), extra_kwargs=kwargs)
+            content, tool_calls, prompt_tokens, completion_tokens = await asyncio.get_event_loop().run_in_executor(
+                None, _call_codex_sync, model, messages, token, kwargs.get("tools"), kwargs
+            )
+            message = {"role": "assistant", **({"tool_calls": tool_calls} if tool_calls else {"content": content})}
+            return ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens})
+        return await _orig_router_acompletion(self, model=model, messages=messages, stream=stream, **kwargs)
+
+    _orig_router_completion = litellm.Router.completion
+    def _wrapped_router_completion(self, model, messages, **kwargs):
+        if _is_gemini_model(model) or _is_codex_model(model):
+            raise RuntimeError("LiteLLM proxy must route managed subscription models asynchronously")
+        return _orig_router_completion(self, model=model, messages=messages, **kwargs)
+
+    litellm.Router.acompletion = _wrapped_router_acompletion
+    litellm.Router.completion = _wrapped_router_completion
+
 
     # Atribuir nos módulos principais do litellm
     litellm.acompletion = _wrapped_acompletion
