@@ -48,3 +48,20 @@ assert thinking_request["thinking"] == {"type": "enabled", "budget_tokens": 8192
 assert thinking_request["max_tokens"] == 16384
 assert "reasoning_effort" not in thinking_request
 print("Claude thinking limits OK")
+
+# OMP's captured wire payload uses max_completion_tokens (OpenAI-style), not
+# max_tokens; the clamp must fold it into max_tokens or the raw high value
+# still reaches Anthropic and reproduces the 2026-08-27 429 regression.
+omp_shaped_request = inject({
+    "model": "claude-opus-5",
+    "reasoning_effort": "high",
+    "max_completion_tokens": 64000,
+    "stream": True,
+    "store": False,
+    "messages": [{"role": "user", "content": "Think."}],
+})
+assert omp_shaped_request["thinking"] == {"type": "enabled", "budget_tokens": 8192}
+assert omp_shaped_request["max_tokens"] == 16384
+assert "max_completion_tokens" not in omp_shaped_request
+assert "reasoning_effort" not in omp_shaped_request
+print("Claude OMP-shaped max_completion_tokens parity OK")

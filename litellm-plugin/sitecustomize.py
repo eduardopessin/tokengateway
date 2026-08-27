@@ -273,7 +273,9 @@ def _inject_claude_prompt(kwargs, args=None):
             thinking_active = False
 
     # Claude Max reserves max_tokens against its short TPM window. Bound extended
-    # thinking requests so OMP's 64k–128k defaults do not cause an immediate 429.
+    # thinking requests so OMP's 64k-128k defaults do not cause an immediate 429.
+    # OMP sends max_completion_tokens (OpenAI-style), not max_tokens; both must be
+    # clamped in lockstep or the uncapped key still reaches Anthropic downstream.
     if thinking_active:
         if isinstance(thinking, dict):
             budget = thinking.get("budget_tokens", 4096)
@@ -285,11 +287,14 @@ def _inject_claude_prompt(kwargs, args=None):
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs.pop("reasoning_effort", None)
 
-        max_tokens = kwargs.get("max_tokens")
-        if max_tokens is None or max_tokens > 16384:
-            kwargs["max_tokens"] = 16384
-        elif max_tokens <= budget:
-            kwargs["max_tokens"] = budget + 2048
+        for _tok_key in ("max_tokens", "max_completion_tokens"):
+            _tok_val = kwargs.get(_tok_key)
+            if _tok_val is None or _tok_val > 16384:
+                kwargs[_tok_key] = 16384
+            elif _tok_val <= budget:
+                kwargs[_tok_key] = budget + 2048
+        if "max_completion_tokens" in kwargs:
+            kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
 
     messages = kwargs.get("messages") or (args[1] if args and len(args) > 1 else [])
     if not isinstance(messages, list):
