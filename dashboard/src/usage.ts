@@ -547,6 +547,49 @@ async function fetchUptimeKuma(): Promise<UsageReport | null> {
 
 // ── AI Autonomous Agents & SRE ─────────────────────────────────────────
 
+const AGENT_PROBE_TIMEOUT_MS = 2_000;
+
+/**
+ * The agent roster is deployment-specific: it is declared in A2A_AGENT_ROSTER as
+ * a JSON array of { name, role, detail }, and liveness is probed against
+ * A2A_INFRA_AGENTS_URL. Nothing about the topology is assumed here.
+ */
+interface RosterEntry {
+	name: string;
+	role: string;
+	detail?: string;
+}
+
+function parseAgentRoster(): RosterEntry[] {
+	const raw = process.env.A2A_AGENT_ROSTER;
+	if (!raw) return [];
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed.flatMap((item) => {
+			if (typeof item !== "object" || item === null) return [];
+			const { name, role, detail } = item as Record<string, unknown>;
+			if (typeof name !== "string" || typeof role !== "string") return [];
+			return [{ name, role, detail: typeof detail === "string" ? detail : undefined }];
+		});
+	} catch {
+		return [];
+	}
+}
+
+/** Optional cluster counters; omitted from the card when not configured. */
+function clusterStats(): Record<string, number> {
+	const stats: Record<string, number> = {};
+	for (const [key, envVar] of [
+		["k3sNodes", "CLUSTER_NODE_COUNT"],
+		["proxmoxVms", "CLUSTER_VM_COUNT"],
+	] as const) {
+		const value = Number.parseInt(process.env[envVar] ?? "", 10);
+		if (Number.isInteger(value) && value >= 0) stats[key] = value;
+	}
+	return stats;
+}
+
 async function fetchAiAgents(): Promise<UsageReport | null> {
 	const a2aUrl = (process.env.A2A_INFRA_AGENTS_URL ?? "").replace(/\/+$/, "");
 	const openhandsUrl = (process.env.OPENHANDS_URL ?? "").replace(/\/+$/, "");
@@ -559,84 +602,67 @@ async function fetchAiAgents(): Promise<UsageReport | null> {
 		label: "Autonomous AI Agents",
 		dashboardUrl: a2aUrl || openhandsUrl,
 		email: "Agent Cluster",
+		limits: [],
 		agentItems: [],
 		fetchedAt: Date.now(),
 	};
 
-	try {
-		const agents: AgentItem[] = [];
+	const agents: AgentItem[] = [];
 
-		// 1. Check A2A In-Cluster Agents (Tech Lead, Reviewer, Sentinel)
+	// 1. In-cluster A2A agents, as declared by the deployment
+	if (a2aUrl) {
 		let a2aOk = false;
 		try {
-			const res = await fetch(`${a2aUrl}/health`, { signal: AbortSignal.timeout(2000) });
-			if (res.ok) a2aOk = true;
+			const res = await fetch(`${a2aUrl}/health`, { signal: AbortSignal.timeout(AGENT_PROBE_TIMEOUT_MS) });
+			a2aOk = res.ok;
 		} catch {
-			// Fallback
+			// Unreachable endpoint is reported as offline, not as an error
 		}
+		for (const entry of parseAgentRoster()) {
+			agents.push({
+				name: entry.name,
+				role: entry.role,
+				status: a2aOk ? "Online" : "Offline",
+				detail: entry.detail ?? "",
+				ok: a2aOk,
+			});
+		}
+	}
 
-		agents.push({
-			name: "Infra Sentinel",
-			role: "SRE & Drift Auditor",
-			status: a2aOk ? "Ativo (Cron 1h)" : "Pronto",
-			detail: "cluster drift audit",
-			ok: true,
-		});
-
-		agents.push({
-			name: "Tech Lead Dispatcher",
-			role: "Arquitetura & Workspaces",
-			status: a2aOk ? "Online (K3s)" : "Pronto",
-			detail: "webhook dispatch",
-			ok: true,
-		});
-
-		agents.push({
-			name: "Code Reviewer",
-			role: "Segurança & Standards",
-			status: a2aOk ? "Online (K3s)" : "Pronto",
-			detail: "review webhook",
-			ok: true,
-		});
-
-		// 2. Check the OpenHands sandbox
+	// 2. OpenHands sandbox, when configured
+	if (openhandsUrl) {
 		let ohOk = false;
-		let ohVersion = "1.40.1";
+		let ohVersion = "";
 		try {
 			const res = await fetch(`${openhandsUrl}/server_info`, {
-				headers: { "X-Session-API-Key": openhandsApiKey },
-				signal: AbortSignal.timeout(2000),
+				headers: openhandsApiKey ? { "X-Session-API-Key": openhandsApiKey } : undefined,
+				signal: AbortSignal.timeout(AGENT_PROBE_TIMEOUT_MS),
 			});
 			if (res.ok) {
 				const data = (await res.json()) as { version?: string };
-				if (data.version) ohVersion = data.version;
+				ohVersion = data.version ?? "";
 				ohOk = true;
 			}
 		} catch {
-			// Fallback
+			// Unreachable endpoint is reported as offline, not as an error
 		}
-
 		agents.push({
 			name: "OpenHands Sandbox",
 			role: "Dev Worker",
-			status: ohOk ? `Online (v${ohVersion})` : "Ativo",
-			detail: "Docker Mode",
-			ok: true,
+			status: ohOk ? (ohVersion ? `Online (v${ohVersion})` : "Online") : "Offline",
+			detail: new URL(openhandsUrl).host,
+			ok: ohOk,
 		});
-
-		report.agentItems = agents;
-		report.plan = `${agents.length} agentes ativos`;
-		report.extraStats = {
-			agentsCount: agents.length,
-			k3sNodes: 0,
-			proxmoxVms: 0,
-			activeSandboxes: 1,
-		};
-		return report;
-	} catch (err) {
-		report.error = String(err);
-		return report;
 	}
+
+	report.agentItems = agents;
+	report.plan = `${agents.length} agentes ativos`;
+	report.extraStats = {
+		agentsCount: agents.length,
+		...clusterStats(),
+		activeSandboxes: agents.filter((a) => a.ok).length,
+	};
+	return report;
 }
 
 // ── Aggregation ────────────────────────────────────────────────────────

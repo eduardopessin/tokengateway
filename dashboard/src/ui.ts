@@ -983,10 +983,10 @@ function render() {
           </div>
         </div>
         <div class="extra-stats-bar">
-          <div class="mini-stat"><span class="mini-stat-label">Agentes</span><span class="mini-stat-val" style="color:var(--agent)">\${stats.agentsCount || list.length}</span></div>
-          <div class="mini-stat"><span class="mini-stat-label">K3s Nós</span><span class="mini-stat-val" style="color:var(--ok)">\${stats.k3sNodes ?? 0}/5</span></div>
-          <div class="mini-stat"><span class="mini-stat-label">Proxmox</span><span class="mini-stat-val" style="color:#38bdf8">\${stats.proxmoxVms ?? 0} VMs</span></div>
-          <div class="mini-stat"><span class="mini-stat-label">Sandbox</span><span class="mini-stat-val" style="color:var(--nvidia)">sandbox</span></div>
+          <div class="mini-stat"><span class="mini-stat-label">Agentes</span><span class="mini-stat-val" style="color:var(--agent)">\${stats.agentsCount ?? list.length}</span></div>
+          \${stats.k3sNodes === undefined ? '' : \`<div class="mini-stat"><span class="mini-stat-label">K3s Nós</span><span class="mini-stat-val" style="color:var(--ok)">\${esc(String(stats.k3sNodes))}</span></div>\`}
+          \${stats.proxmoxVms === undefined ? '' : \`<div class="mini-stat"><span class="mini-stat-label">VMs</span><span class="mini-stat-val" style="color:#38bdf8">\${esc(String(stats.proxmoxVms))}</span></div>\`}
+          <div class="mini-stat"><span class="mini-stat-label">Online</span><span class="mini-stat-val" style="color:var(--nvidia)">\${stats.activeSandboxes ?? 0}</span></div>
         </div>
         <div class="monitor-list" style="max-height:220px">\`;
         for (const ag of list) {

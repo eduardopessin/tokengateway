@@ -885,6 +885,7 @@ function render() {
   const agentReport = state.reports.find(r => r.provider === 'ai-agents');
   if (agentReport) {
     const stats = agentReport.extraStats || {};
+    const list = agentReport.agentItems || [];
     html += `<div class="provider-card ai-agents">
       <div>
         <div class="card-header">
@@ -898,15 +899,15 @@ function render() {
           <div class="badge-group">
             <span class="pill peak">
               <span class="pill-dot" style="background:var(--ok)"></span>
-              ${stats.agentsCount || 4} ativos
+              ${stats.agentsCount ?? list.length} ativos
             </span>
           </div>
         </div>
         <div class="extra-stats-bar">
-          <div class="mini-stat"><span class="mini-stat-label">Agentes</span><span class="mini-stat-val" style="color:#a855f7">${stats.agentsCount || 4}</span></div>
-          <div class="mini-stat"><span class="mini-stat-label">Nós K3s</span><span class="mini-stat-val">${stats.k3sNodes ?? 0}</span></div>
-          <div class="mini-stat"><span class="mini-stat-label">VMs PVE</span><span class="mini-stat-val">${stats.proxmoxVms ?? 0}</span></div>
-          <div class="mini-stat"><span class="mini-stat-label">Sandboxes</span><span class="mini-stat-val" style="color:var(--ok)">${stats.activeSandboxes || 1}</span></div>
+          <div class="mini-stat"><span class="mini-stat-label">Agentes</span><span class="mini-stat-val" style="color:#a855f7">${stats.agentsCount ?? list.length}</span></div>
+          ${stats.k3sNodes === undefined ? '' : `<div class="mini-stat"><span class="mini-stat-label">Nós K3s</span><span class="mini-stat-val">${stats.k3sNodes}</span></div>`}
+          ${stats.proxmoxVms === undefined ? '' : `<div class="mini-stat"><span class="mini-stat-label">VMs</span><span class="mini-stat-val">${stats.proxmoxVms}</span></div>`}
+          <div class="mini-stat"><span class="mini-stat-label">Online</span><span class="mini-stat-val" style="color:var(--ok)">${stats.activeSandboxes ?? 0}</span></div>
         </div>
       </div></div>`;
   }
