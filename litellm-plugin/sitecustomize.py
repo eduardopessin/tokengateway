@@ -504,9 +504,6 @@ def _codex_request_body(model, messages, tools, extra_kwargs):
         tool_choice = _codex_tool_choice(extra_kwargs.get("tool_choice"))
         if tool_choice is not None:
             body["tool_choice"] = tool_choice
-        max_tokens = extra_kwargs.get("max_tokens")
-        if max_tokens is not None:
-            body["max_output_tokens"] = max_tokens
         effort = extra_kwargs.get("reasoning_effort")
         if effort is not None:
             body["reasoning"] = {

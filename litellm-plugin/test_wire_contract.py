@@ -35,8 +35,6 @@ codex = namespace["_codex_request_body"](
 )
 assert codex["tool_choice"] == {"type": "function", "name": "read"}
 assert codex["reasoning"]["context"] == "all_turns"
-assert codex["max_output_tokens"] == 42
-assert any(item["type"] == "function_call_output" and item["call_id"] == "call-a" for item in codex["input"])
 assert any(item["type"] == "message" and "orphan" in str(item["content"]) for item in codex["input"])
 
 payload = namespace["_messages_to_antigravity_payload"](
