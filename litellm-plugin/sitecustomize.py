@@ -150,7 +150,11 @@ class TokenManager:
                         req = urllib.request.Request(
                             "https://api.anthropic.com/v1/oauth/token",
                             data=data,
-                            headers={"Content-Type": "application/json"}
+                            headers={
+                                "Content-Type": "application/json",
+                                "anthropic-beta": "oauth-2025-04-20",
+                                "User-Agent": "anthropic-sdk-typescript/0.94.0 userOAuthProvider"
+                            }
                         )
                         with urllib.request.urlopen(req, timeout=15) as resp:
                             res = json.loads(resp.read().decode("utf-8"))
@@ -259,7 +263,7 @@ def _inject_claude_prompt(kwargs, args=None):
 
         messages = kwargs.get("messages") or (args[1] if args and len(args) > 1 else [])
         if isinstance(messages, list):
-            # Consolidação limpa de mensagens de sistema para Anthropic Prompt Caching
+            # Consolidação limpa e determinística do System Prompt com cache_control
             system_parts = []
             non_system_messages = []
             has_claude_cli_prompt = False
@@ -290,30 +294,8 @@ def _inject_claude_prompt(kwargs, args=None):
                 "content": [{"type": "text", "text": merged_system_text, "cache_control": {"type": "ephemeral"}}]
             }
 
-            processed_msgs = [consolidated_system]
-
-            # Copia o restante das mensagens e injeta cache_control no último turno prévio
-            for m in non_system_messages:
-                processed_msgs.append(dict(m) if isinstance(m, dict) else m)
-
-            # Adiciona cache_control no último turno de user/tool histórico (se houver mais de 1 turno)
-            user_tool_indices = [idx for idx, msg in enumerate(processed_msgs) if isinstance(msg, dict) and msg.get("role") in ("user", "tool") and idx != len(processed_msgs) - 1]
-            if user_tool_indices:
-                target_idx = user_tool_indices[-1]
-                t_msg = dict(processed_msgs[target_idx])
-                t_content = t_msg.get("content")
-                if isinstance(t_content, str):
-                    t_msg["content"] = [{"type": "text", "text": t_content, "cache_control": {"type": "ephemeral"}}]
-                    processed_msgs[target_idx] = t_msg
-                elif isinstance(t_content, list):
-                    has_cc = any(isinstance(c, dict) and "cache_control" in c for c in t_content)
-                    if not has_cc and len(t_content) > 0:
-                        c_last = dict(t_content[-1])
-                        c_last["cache_control"] = {"type": "ephemeral"}
-                        t_msg["content"] = t_content[:-1] + [c_last]
-                        processed_msgs[target_idx] = t_msg
-
-            kwargs["messages"] = processed_msgs
+            # Preservar estritamente as mensagens de utilizador, assistente e ferramentas sem mutação de schema
+            kwargs["messages"] = [consolidated_system] + list(non_system_messages)
     return kwargs
 
 # --- 3.1. OpenAI Codex Bridge ---
