@@ -237,7 +237,7 @@ _token_manager = TokenManager()
 _thought_signatures = {}
 
 # --- 3. Funções auxiliares para Claude Code, OpenAI Codex e Google Antigravity ---
-CLAUDE_CODE_PROMPT = "You are Claude Code, Anthropic's official CLI for Claude."
+CLAUDE_CODE_PROMPT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 
 def _inject_claude_prompt(kwargs, args=None):
     model = str(kwargs.get("model", "") or (args[0] if args and len(args) > 0 else "")).lower()
@@ -247,11 +247,10 @@ def _inject_claude_prompt(kwargs, args=None):
             kwargs["api_key"] = fresh_anthropic_token
             os.environ["ANTHROPIC_OAUTH_TOKEN"] = fresh_anthropic_token
 
-        # Garantir headers oficiais para prompt-caching e oauth na Anthropic
         extra_hdrs = kwargs.setdefault("extra_headers", {})
         if isinstance(extra_hdrs, dict):
-            extra_hdrs["anthropic-beta"] = "oauth-2025-04-20,prompt-caching-2024-07-31"
-            extra_hdrs["User-Agent"] = "anthropic-sdk-typescript/0.94.0 userOAuthProvider"
+            extra_hdrs["anthropic-beta"] = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11"
+            extra_hdrs["User-Agent"] = "claude-cli/2.1.220 (external, cli)"
 
         # Regra estrita da Anthropic: temperature só pode ser 1.0 quando thinking está ligado
         temp = kwargs.get("temperature")
