@@ -246,6 +246,12 @@ def _inject_claude_prompt(kwargs, args=None):
             kwargs["api_key"] = fresh_anthropic_token
             os.environ["ANTHROPIC_OAUTH_TOKEN"] = fresh_anthropic_token
 
+        # Garantir headers oficiais para prompt-caching e oauth na Anthropic
+        extra_hdrs = kwargs.setdefault("extra_headers", {})
+        if isinstance(extra_hdrs, dict):
+            extra_hdrs["anthropic-beta"] = "oauth-2025-04-20,prompt-caching-2024-07-31"
+            extra_hdrs["User-Agent"] = "anthropic-sdk-typescript/0.94.0 userOAuthProvider"
+
         # Regra estrita da Anthropic: temperature só pode ser 1.0 quando thinking está ligado
         temp = kwargs.get("temperature")
         thinking_enabled = bool(kwargs.get("thinking"))
