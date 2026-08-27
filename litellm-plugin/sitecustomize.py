@@ -3,6 +3,7 @@ import sys
 import os
 import json
 import time
+import datetime
 import uuid
 import asyncio
 import base64
@@ -494,6 +495,41 @@ def _codex_tool_choice(choice):
     if choice.get("type") == "function" and isinstance(function, dict) and function.get("name"):
         return {"type": "function", "name": function["name"]}
     return choice
+
+# --- Spend logging for bridge-served responses ---
+# The Codex and Antigravity bridges answer requests themselves, so LiteLLM never
+# wraps them in CustomStreamWrapper and no success callback fires. Without this,
+# successful bridge completions are absent from /spend/logs entirely and only
+# their exceptions get recorded by the proxy error handler.
+async def _emit_bridge_success(logging_obj, response, start_time, end_time):
+    if logging_obj is None or response is None:
+        return
+    try:
+        await logging_obj.async_success_handler(response, start_time, end_time)
+    except Exception as log_err:
+        print(f"[sitecustomize] bridge spend log falhou: {log_err}", file=sys.stderr)
+
+async def _logged_bridge_stream(generator, logging_obj, messages, start_time):
+    """Pass bridge chunks through untouched, then emit one spend-log row.
+
+    Reassembly is best effort: a logging failure must never break an otherwise
+    healthy stream. Client disconnects skip the record rather than awaiting
+    inside a closing generator.
+    """
+    chunks = []
+    async for chunk in generator:
+        chunks.append(chunk)
+        yield chunk
+    if logging_obj is None or not chunks:
+        return
+    try:
+        end_time = datetime.datetime.now()
+        response = litellm.stream_chunk_builder(
+            chunks, messages=messages, start_time=start_time, end_time=end_time
+        )
+        await _emit_bridge_success(logging_obj, response, start_time, end_time)
+    except Exception as log_err:
+        print(f"[sitecustomize] bridge stream spend log falhou: {log_err}", file=sys.stderr)
 
 def _strip_codex_output_limits(kwargs):
     for key in ("max_tokens", "max_output_tokens", "max_completion_tokens"):
@@ -1104,6 +1140,8 @@ try:
         args = ()
         model = str(kwargs.get("model", ""))
         messages = kwargs.get("messages") or []
+        logging_obj = kwargs.get("litellm_logging_obj")
+        start_time = datetime.datetime.now()
 
         # Google Antigravity (Gemini) Bridge
         if _is_gemini_model(model):
@@ -1112,7 +1150,10 @@ try:
             if google_token:
                 tools = kwargs.get("tools")
                 if kwargs.get("stream", False):
-                    return _stream_antigravity_generator(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs)
+                    return _logged_bridge_stream(
+                        _stream_antigravity_generator(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs),
+                        logging_obj, messages, start_time,
+                    )
                 else:
                     loop = asyncio.get_event_loop()
                     content, tool_calls, pt, ct = await loop.run_in_executor(None, _call_antigravity_sync, model, messages, google_token, google_project, tools, kwargs)
@@ -1123,7 +1164,7 @@ try:
                     else:
                         msg["content"] = content
                         finish_reason = "stop"
-                    return ModelResponse(
+                    response = ModelResponse(
                         id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
                         object="chat.completion",
                         created=int(time.time()),
@@ -1131,6 +1172,8 @@ try:
                         choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
                         usage={"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
                     )
+                    await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
+                    return response
 
         # OpenAI Codex Bridge
         if _is_codex_model(model):
@@ -1140,7 +1183,10 @@ try:
                 raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
             tools = kwargs.get("tools")
             if kwargs.get("stream", False):
-                return _stream_codex_generator(model, messages, codex_token, tools=tools, extra_kwargs=kwargs)
+                return _logged_bridge_stream(
+                    _stream_codex_generator(model, messages, codex_token, tools=tools, extra_kwargs=kwargs),
+                    logging_obj, messages, start_time,
+                )
             else:
                 loop = asyncio.get_event_loop()
                 content, tool_calls, pt, ct = await loop.run_in_executor(None, _call_codex_sync, model, messages, codex_token, tools, kwargs)
@@ -1151,7 +1197,7 @@ try:
                 else:
                     msg["content"] = content
                     finish_reason = "stop"
-                return ModelResponse(
+                response = ModelResponse(
                     id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
                     object="chat.completion",
                     created=int(time.time()),
@@ -1159,6 +1205,8 @@ try:
                     choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
                     usage={"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
                 )
+                await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
+                return response
 
         return await _orig_acompletion(*args, **_inject_claude_prompt(kwargs, args))
 
@@ -1225,29 +1273,41 @@ try:
     # OpenAI max_tokens into the unsupported Responses max_output_tokens.
     _orig_router_acompletion = litellm.Router.acompletion
     async def _wrapped_router_acompletion(self, model, messages, stream=False, **kwargs):
+        logging_obj = kwargs.get("litellm_logging_obj")
+        start_time = datetime.datetime.now()
         if _is_gemini_model(model):
             token = _token_manager.get_google_token()
             if token:
                 project = _token_manager.get_google_project_id()
                 if stream:
-                    return _stream_antigravity_generator(model, messages, token, project, tools=kwargs.get("tools"), extra_kwargs=kwargs)
+                    return _logged_bridge_stream(
+                        _stream_antigravity_generator(model, messages, token, project, tools=kwargs.get("tools"), extra_kwargs=kwargs),
+                        logging_obj, messages, start_time,
+                    )
                 content, tool_calls, prompt_tokens, completion_tokens = await asyncio.get_event_loop().run_in_executor(
                     None, _call_antigravity_sync, model, messages, token, project, kwargs.get("tools"), kwargs
                 )
                 message = {"role": "assistant", **({"tool_calls": tool_calls} if tool_calls else {"content": content})}
-                return ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens})
+                response = ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens})
+                await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
+                return response
         if _is_codex_model(model):
             _strip_codex_output_limits(kwargs)
             token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
             if not token:
                 raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
             if stream:
-                return _stream_codex_generator(model, messages, token, tools=kwargs.get("tools"), extra_kwargs=kwargs)
+                return _logged_bridge_stream(
+                    _stream_codex_generator(model, messages, token, tools=kwargs.get("tools"), extra_kwargs=kwargs),
+                    logging_obj, messages, start_time,
+                )
             content, tool_calls, prompt_tokens, completion_tokens = await asyncio.get_event_loop().run_in_executor(
                 None, _call_codex_sync, model, messages, token, kwargs.get("tools"), kwargs
             )
             message = {"role": "assistant", **({"tool_calls": tool_calls} if tool_calls else {"content": content})}
-            return ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens})
+            response = ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens})
+            await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
+            return response
         return await _orig_router_acompletion(self, model=model, messages=messages, stream=stream, **kwargs)
 
     _orig_router_completion = litellm.Router.completion
