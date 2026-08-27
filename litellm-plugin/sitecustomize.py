@@ -12,6 +12,11 @@ import urllib.parse
 import threading
 import httpx
 
+import litellm
+import litellm.main
+import litellm.router
+from litellm.types.utils import ModelResponse, ModelResponseStream, StreamingChoices, Delta
+
 os.environ.setdefault("GEMINI_API_KEY", "dummy-antigravity")
 os.environ.setdefault("GOOGLE_API_KEY", "dummy-antigravity")
 
@@ -45,31 +50,21 @@ try:
 except Exception as _e:
     print(f"[sitecustomize] litellm mcp patch ignorado: {_e}", file=sys.stderr)
 
-# --- helper: atomically persist tokens across Kubernetes Secrets ---
-LITELLM_NAMESPACE = os.environ.get("LITELLM_NAMESPACE", "litellm")
-LITELLM_SECRET_NAME = os.environ.get("LITELLM_SECRET_NAME", "litellm-secrets")
-QUOTA_DASHBOARD_NAMESPACE = os.environ.get("QUOTA_DASHBOARD_NAMESPACE", "quota-dashboard")
-QUOTA_DASHBOARD_SECRET_NAME = os.environ.get("QUOTA_DASHBOARD_SECRET_NAME", "quota-dashboard-credentials")
-
+# --- helper: persiste tokens atomicamente em litellm-secrets E quota-dashboard-credentials ---
 def _persist_tokens_to_secret(updates: dict):
     try:
-        sa_token_path = '/var/run/secrets/kubernetes.io/serviceaccount/token'
-        ca_path = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
-        if not os.path.exists(sa_token_path) or not os.path.exists(ca_path):
-            return
-
-        sa_token = open(sa_token_path).read()
-        ca = ca_path
+        sa_token = open('/var/run/secrets/kubernetes.io/serviceaccount/token').read()
+        ca = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
         host = os.environ.get('KUBERNETES_SERVICE_HOST', 'kubernetes.default.svc')
         port = os.environ.get('KUBERNETES_SERVICE_PORT', '443')
         ctx = ssl.create_default_context(cafile=ca)
 
-        # 1. Update litellm-secrets
+        # 1. Atualizar litellm-secrets no namespace litellm
         patch = {k: base64.b64encode(v.encode()).decode() for k, v in updates.items() if v}
         if patch:
             body = json.dumps({'data': patch}).encode()
             req = urllib.request.Request(
-                f'https://{host}:{port}/api/v1/namespaces/{LITELLM_NAMESPACE}/secrets/{LITELLM_SECRET_NAME}',
+                f'https://{host}:{port}/api/v1/namespaces/litellm/secrets/litellm-secrets',
                 data=body, method='PATCH',
                 headers={
                     'Authorization': f'Bearer {sa_token}',
@@ -77,12 +72,12 @@ def _persist_tokens_to_secret(updates: dict):
                 }
             )
             urllib.request.urlopen(req, context=ctx, timeout=5)
-            print(f"[TokenManager] {LITELLM_SECRET_NAME} persisted: {list(updates.keys())}", file=sys.stderr)
+            print(f"[TokenManager] litellm-secrets persistido: {list(updates.keys())}", file=sys.stderr)
 
-        # 2. Synchronize quota-dashboard-credentials if present
+        # 2. Sincronizar simultaneamente quota-dashboard-credentials no namespace quota-dashboard
         try:
             req_get = urllib.request.Request(
-                f'https://{host}:{port}/api/v1/namespaces/{QUOTA_DASHBOARD_NAMESPACE}/secrets/{QUOTA_DASHBOARD_SECRET_NAME}',
+                f'https://{host}:{port}/api/v1/namespaces/quota-dashboard/secrets/quota-dashboard-credentials',
                 headers={'Authorization': f'Bearer {sa_token}'}
             )
             with urllib.request.urlopen(req_get, context=ctx, timeout=5) as resp_q:
@@ -104,7 +99,7 @@ def _persist_tokens_to_secret(updates: dict):
                 new_q_b64 = base64.b64encode(json.dumps(q_creds, indent=2).encode()).decode()
                 patch_q_body = json.dumps({'data': {'credentials.json': new_q_b64}}).encode()
                 req_patch_q = urllib.request.Request(
-                    f'https://{host}:{port}/api/v1/namespaces/{QUOTA_DASHBOARD_NAMESPACE}/secrets/{QUOTA_DASHBOARD_SECRET_NAME}',
+                    f'https://{host}:{port}/api/v1/namespaces/quota-dashboard/secrets/quota-dashboard-credentials',
                     data=patch_q_body, method='PATCH',
                     headers={
                         'Authorization': f'Bearer {sa_token}',
@@ -112,18 +107,18 @@ def _persist_tokens_to_secret(updates: dict):
                     }
                 )
                 urllib.request.urlopen(req_patch_q, context=ctx, timeout=5)
-                print(f"[TokenManager] {QUOTA_DASHBOARD_SECRET_NAME} synchronized atomically", file=sys.stderr)
+                print(f"[TokenManager] quota-dashboard-credentials sincronizado atomicamente", file=sys.stderr)
         except Exception as eq:
-            print(f"[TokenManager] Notice: failed to sync {QUOTA_DASHBOARD_SECRET_NAME}: {eq}", file=sys.stderr)
+            print(f"[TokenManager] Aviso: falhou sincronizar quota-dashboard-credentials: {eq}", file=sys.stderr)
 
     except Exception as e:
-        print(f"[TokenManager] Notice: failed to persist secret: {e}", file=sys.stderr)
+        print(f"[TokenManager] Aviso: falhou persistir secret: {e}", file=sys.stderr)
 
-# --- 2. In-Memory Token Manager with Auto-Refresh ---
-ANTHROPIC_CLIENT_ID = os.environ.get("ANTHROPIC_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
-CODEX_CLIENT_ID = os.environ.get("CODEX_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com")
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "***REMOVED***")
+# --- 2. Token Manager com Auto-Refresh em memória ---
+ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+GOOGLE_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+GOOGLE_CLIENT_SECRET = "***REMOVED***"
 
 class TokenManager:
     def __init__(self):
@@ -247,10 +242,11 @@ def _inject_claude_prompt(kwargs, args=None):
             kwargs["api_key"] = fresh_anthropic_token
             os.environ["ANTHROPIC_OAUTH_TOKEN"] = fresh_anthropic_token
 
-        # Fix Anthropic extended thinking temperature rule
+        # Regra estrita da Anthropic: temperature só pode ser 1.0 quando thinking está ligado
         temp = kwargs.get("temperature")
+        thinking_enabled = bool(kwargs.get("thinking"))
         if temp is not None and float(temp) != 1.0:
-            if kwargs.get("thinking"):
+            if thinking_enabled:
                 kwargs["temperature"] = 1.0
             else:
                 kwargs.pop("reasoning_effort", None)
@@ -263,20 +259,61 @@ def _inject_claude_prompt(kwargs, args=None):
 
         messages = kwargs.get("messages") or (args[1] if args and len(args) > 1 else [])
         if isinstance(messages, list):
-            has_prompt = False
+            # Consolidação limpa de mensagens de sistema para Anthropic Prompt Caching
+            system_parts = []
+            non_system_messages = []
+            has_claude_cli_prompt = False
+
             for m in messages:
                 if isinstance(m, dict) and m.get("role") == "system":
                     c = m.get("content", "")
-                    if isinstance(c, str) and CLAUDE_CODE_PROMPT in c:
-                        has_prompt = True
-                        break
+                    if isinstance(c, str):
+                        if CLAUDE_CODE_PROMPT in c:
+                            has_claude_cli_prompt = True
+                        system_parts.append(c)
                     elif isinstance(c, list):
                         for item in c:
-                            if isinstance(item, dict) and CLAUDE_CODE_PROMPT in str(item.get("text", "")):
-                                has_prompt = True
-                                break
-            if not has_prompt:
-                kwargs["messages"] = [{"role": "system", "content": CLAUDE_CODE_PROMPT}] + list(messages)
+                            if isinstance(item, dict):
+                                txt = str(item.get("text", ""))
+                                if CLAUDE_CODE_PROMPT in txt:
+                                    has_claude_cli_prompt = True
+                                system_parts.append(txt)
+                else:
+                    non_system_messages.append(m)
+
+            if not has_claude_cli_prompt:
+                system_parts.insert(0, CLAUDE_CODE_PROMPT)
+
+            merged_system_text = "\n\n".join(part.strip() for part in system_parts if part.strip())
+            consolidated_system = {
+                "role": "system",
+                "content": [{"type": "text", "text": merged_system_text, "cache_control": {"type": "ephemeral"}}]
+            }
+
+            processed_msgs = [consolidated_system]
+
+            # Copia o restante das mensagens e injeta cache_control no último turno prévio
+            for m in non_system_messages:
+                processed_msgs.append(dict(m) if isinstance(m, dict) else m)
+
+            # Adiciona cache_control no último turno de user/tool histórico (se houver mais de 1 turno)
+            user_tool_indices = [idx for idx, msg in enumerate(processed_msgs) if isinstance(msg, dict) and msg.get("role") in ("user", "tool") and idx != len(processed_msgs) - 1]
+            if user_tool_indices:
+                target_idx = user_tool_indices[-1]
+                t_msg = dict(processed_msgs[target_idx])
+                t_content = t_msg.get("content")
+                if isinstance(t_content, str):
+                    t_msg["content"] = [{"type": "text", "text": t_content, "cache_control": {"type": "ephemeral"}}]
+                    processed_msgs[target_idx] = t_msg
+                elif isinstance(t_content, list):
+                    has_cc = any(isinstance(c, dict) and "cache_control" in c for c in t_content)
+                    if not has_cc and len(t_content) > 0:
+                        c_last = dict(t_content[-1])
+                        c_last["cache_control"] = {"type": "ephemeral"}
+                        t_msg["content"] = t_content[:-1] + [c_last]
+                        processed_msgs[target_idx] = t_msg
+
+            kwargs["messages"] = processed_msgs
     return kwargs
 
 # --- 3.1. OpenAI Codex Bridge ---
@@ -284,13 +321,38 @@ def _is_codex_model(model_str):
     m = str(model_str).lower()
     return "gpt-5" in m or "codex" in m
 
+def _extract_account_id(tok):
+    try:
+        parts = tok.split(".")
+        if len(parts) != 3:
+            return None
+        padding = len(parts[1]) % 4
+        padded = parts[1] + ("=" * (4 - padding) if padding else "")
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        return payload.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+    except:
+        return None
+
+def _build_codex_headers(tok):
+    headers = {
+        "Authorization": f"Bearer {tok}",
+        "Content-Type": "application/json",
+        "accept": "text/event-stream",
+        "originator": "pi",
+        "OpenAI-Beta": "responses=experimental",
+        "User-Agent": "pi (linux; x86_64)"
+    }
+    acc = _extract_account_id(tok)
+    if acc:
+        headers["chatgpt-account-id"] = acc
+    return headers
 def _messages_to_codex_input(messages):
     codex_input = []
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content")
         
-        # Handle tool results (role == "tool")
+        # Tratar resultados de ferramentas (role == "tool")
         if role == "tool":
             tool_call_id = m.get("tool_call_id") or ""
             text_out = str(content) if not isinstance(content, list) else "".join(
@@ -303,7 +365,7 @@ def _messages_to_codex_input(messages):
             })
             continue
 
-        # Extract text content
+        # Extrair texto
         if isinstance(content, list):
             text_parts = []
             for part in content:
@@ -327,7 +389,7 @@ def _messages_to_codex_input(messages):
                 "content": [{"type": content_type, "text": content_text}]
             })
 
-        # Handle tool calls in assistant messages
+        # Tratar chamadas de ferramentas emitidas pelo assistente
         if m.get("tool_calls"):
             for tc in m.get("tool_calls", []):
                 func = tc.get("function") or {}
@@ -386,28 +448,24 @@ def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
         effort = extra_kwargs.get("reasoning_effort")
         if effort and str(effort).lower() != "none":
             body["reasoning"] = {"effort": str(effort).lower(), "summary": "auto"}
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "accept": "text/event-stream",
-        "originator": "pi"
-    }
+    headers = _build_codex_headers(token)
     
     full_text = []
     tool_calls = []
     active_tools = {}
+    prompt_tokens = 10
+    completion_tokens = 10
 
-    with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+    with httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
         resp = client.send(client.build_request("POST", url, json=body, headers=headers), stream=True)
         if resp.status_code == 401:
             resp.close()
             fresh_token = _token_manager.get_codex_token(force_refresh=True)
             if fresh_token:
-                headers["Authorization"] = f"Bearer {fresh_token}"
+                headers = _build_codex_headers(fresh_token)
                 resp = client.send(client.build_request("POST", url, json=body, headers=headers), stream=True)
             else:
                 resp.raise_for_status()
-
         if resp.status_code != 200:
             err_text = resp.read().decode("utf-8", "replace")
             resp.close()
@@ -445,14 +503,21 @@ def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
                                 tool_calls.append(active_tools.pop(item_id))
                     elif etype == "response.output_text.delta":
                         full_text.append(event.get("delta", ""))
-                except:
+                    elif etype == "response.completed":
+                        usage = event.get("response", {}).get("usage") or {}
+                        prompt_tokens = usage.get("input_tokens", prompt_tokens)
+                        completion_tokens = usage.get("output_tokens", completion_tokens)
+                    elif etype in ["response.failed", "error"]:
+                        err_obj = event.get("response", {}).get("error") or event.get("message") or "Unknown error"
+                        raise Exception(f"OpenAI Codex stream failed: {err_obj}")
+                except Exception as parse_err:
+                    if "OpenAI Codex stream failed" in str(parse_err):
+                        raise parse_err
                     pass
         resp.close()
 
-    return "".join(full_text), tool_calls
-
+    return "".join(full_text), tool_calls, prompt_tokens, completion_tokens
 async def _stream_codex_generator(model, messages, token, tools=None, extra_kwargs=None):
-    from litellm import ModelResponse
     url = "https://chatgpt.com/backend-api/codex/responses"
     codex_input = _messages_to_codex_input(messages)
     codex_tools = _tools_to_codex_tools(tools)
@@ -471,31 +536,25 @@ async def _stream_codex_generator(model, messages, token, tools=None, extra_kwar
         effort = extra_kwargs.get("reasoning_effort")
         if effort and str(effort).lower() != "none":
             body["reasoning"] = {"effort": str(effort).lower(), "summary": "auto"}
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "accept": "text/event-stream",
-        "originator": "pi"
-    }
-    
+    headers = _build_codex_headers(token)
+
     resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
-    
-    current_tool_index = 0
     active_tool_map = {}
+    current_tool_index = 0
     has_tool_calls = False
+    completion_status = "completed"
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
         resp = await client.send(client.build_request("POST", url, json=body, headers=headers), stream=True)
         if resp.status_code == 401:
             await resp.aclose()
             fresh_token = _token_manager.get_codex_token(force_refresh=True)
             if fresh_token:
-                headers["Authorization"] = f"Bearer {fresh_token}"
+                headers = _build_codex_headers(fresh_token)
                 resp = await client.send(client.build_request("POST", url, json=body, headers=headers), stream=True)
             else:
                 resp.raise_for_status()
-
         if resp.status_code != 200:
             err_text = (await resp.aread()).decode("utf-8", "replace")
             await resp.aclose()
@@ -518,16 +577,15 @@ async def _stream_codex_generator(model, messages, token, tools=None, extra_kwar
                             call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}"
                             fn_name = item.get("name", "")
                             active_tool_map[item.get("id")] = (current_tool_index, call_id, fn_name)
-                            yield ModelResponse(
+                            yield ModelResponseStream(
                                 id=resp_id,
-                                object="chat.completion.chunk",
                                 created=created,
                                 model=model,
-                                choices=[{
-                                    "index": 0,
-                                    "delta": {
-                                        "role": "assistant",
-                                        "tool_calls": [{
+                                choices=[StreamingChoices(
+                                    index=0,
+                                    delta=Delta(
+                                        role="assistant",
+                                        tool_calls=[{
                                             "index": current_tool_index,
                                             "id": call_id,
                                             "type": "function",
@@ -536,9 +594,9 @@ async def _stream_codex_generator(model, messages, token, tools=None, extra_kwar
                                                 "arguments": ""
                                             }
                                         }]
-                                    },
-                                    "finish_reason": None
-                                }]
+                                    ),
+                                    finish_reason=None
+                                )]
                             )
                             current_tool_index += 1
 
@@ -548,48 +606,70 @@ async def _stream_codex_generator(model, messages, token, tools=None, extra_kwar
                         tindex = tinfo[0] if tinfo else 0
                         delta = event.get("delta", "")
                         if delta:
-                            yield ModelResponse(
+                            yield ModelResponseStream(
                                 id=resp_id,
-                                object="chat.completion.chunk",
                                 created=created,
                                 model=model,
-                                choices=[{
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [{
+                                choices=[StreamingChoices(
+                                    index=0,
+                                    delta=Delta(
+                                        tool_calls=[{
                                             "index": tindex,
                                             "function": {
                                                 "arguments": delta
                                             }
                                         }]
-                                    },
-                                    "finish_reason": None
-                                }]
+                                    ),
+                                    finish_reason=None
+                                )]
                             )
 
-                    elif etype == "response.output_text.delta":
+                    elif etype in ["response.reasoning_text.delta", "response.reasoning_summary_text.delta"]:
                         delta = event.get("delta", "")
                         if delta:
-                            yield ModelResponse(
+                            yield ModelResponseStream(
                                 id=resp_id,
-                                object="chat.completion.chunk",
                                 created=created,
                                 model=model,
-                                choices=[{"index": 0, "delta": {"content": delta}, "finish_reason": None}]
+                                choices=[StreamingChoices(
+                                    index=0,
+                                    delta=Delta(reasoning_content=delta),
+                                    finish_reason=None
+                                )]
                             )
+
+                    elif etype in ["response.output_text.delta", "response.refusal.delta"]:
+                        delta = event.get("delta", "")
+                        if delta:
+                            yield ModelResponseStream(
+                                id=resp_id,
+                                created=created,
+                                model=model,
+                                choices=[StreamingChoices(
+                                    index=0,
+                                    delta=Delta(content=delta),
+                                    finish_reason=None
+                                )]
+                            )
+                    elif etype == "response.completed":
+                        resp_data = event.get("response", {})
+                        completion_status = resp_data.get("status", "completed")
+                    elif etype in ["response.failed", "error"]:
+                        err_obj = event.get("response", {}).get("error") or event.get("message") or "Unknown error"
+                        raise Exception(f"OpenAI Codex stream failed: {err_obj}")
                 except Exception as parse_err:
+                    if "OpenAI Codex stream failed" in str(parse_err):
+                        raise parse_err
                     pass
         await resp.aclose()
 
-    finish_reason = "tool_calls" if has_tool_calls else "stop"
-    yield ModelResponse(
+    finish_reason = "tool_calls" if has_tool_calls else ("length" if completion_status == "incomplete" else "stop")
+    yield ModelResponseStream(
         id=resp_id,
-        object="chat.completion.chunk",
         created=created,
         model=model,
-        choices=[{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+        choices=[StreamingChoices(index=0, delta=Delta(), finish_reason=finish_reason)]
     )
-
 # --- 3.2. Google Antigravity Bridge ---
 def _is_gemini_model(model_str):
     m = str(model_str).lower()
@@ -763,7 +843,7 @@ def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra
     prompt_tokens = 10
     completion_tokens = 10
 
-    with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+    with httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
         resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
         if resp.status_code == 401:
             resp.close()
@@ -773,7 +853,6 @@ def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra
                 resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
             else:
                 resp.raise_for_status()
-
         if resp.status_code in [503, 404] and payload.get("model") != "gemini-3.7-flash-low":
             resp.close()
             payload["model"] = "gemini-3.7-flash-low"
@@ -824,7 +903,6 @@ def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra
     return "".join(full_text), tool_calls, prompt_tokens, completion_tokens
 
 async def _stream_antigravity_generator(model, messages, token, project_id, tools=None, extra_kwargs=None):
-    from litellm import ModelResponse
     url = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
     payload = _messages_to_antigravity_payload(model, messages, project_id, tools=tools, extra_kwargs=extra_kwargs)
     headers = {
@@ -839,7 +917,7 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
     current_tool_index = 0
     has_tool_calls = False
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
         resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
         if resp.status_code == 401:
             await resp.aclose()
@@ -849,7 +927,6 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
                 resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
             else:
                 resp.raise_for_status()
-
         if resp.status_code in [503, 404] and payload.get("model") != "gemini-3.7-flash-low":
             await resp.aclose()
             payload["model"] = "gemini-3.7-flash-low"
@@ -875,12 +952,13 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
                         for p in parts:
                             txt = p.get("text", "")
                             if txt:
-                                yield ModelResponse(
+                                is_thought = bool(p.get("thought", False))
+                                delta_obj = Delta(reasoning_content=txt) if is_thought else Delta(content=txt)
+                                yield ModelResponseStream(
                                     id=resp_id,
-                                    object="chat.completion.chunk",
                                     created=created,
                                     model=model,
-                                    choices=[{"index": 0, "delta": {"content": txt}, "finish_reason": None}]
+                                    choices=[StreamingChoices(index=0, delta=delta_obj, finish_reason=None)]
                                 )
                             fc = p.get("functionCall")
                             if fc:
@@ -892,17 +970,15 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
                                 fn_name = fc.get("name", "")
                                 fn_args = json.dumps(fc.get("args") or {})
                                 
-                                # Chunk 1: Tool call start
-                                yield ModelResponse(
+                                yield ModelResponseStream(
                                     id=resp_id,
-                                    object="chat.completion.chunk",
                                     created=created,
                                     model=model,
-                                    choices=[{
-                                        "index": 0,
-                                        "delta": {
-                                            "role": "assistant",
-                                            "tool_calls": [{
+                                    choices=[StreamingChoices(
+                                        index=0,
+                                        delta=Delta(
+                                            role="assistant",
+                                            tool_calls=[{
                                                 "index": current_tool_index,
                                                 "id": call_id,
                                                 "type": "function",
@@ -911,52 +987,52 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
                                                     "arguments": ""
                                                 }
                                             }]
-                                        },
-                                        "finish_reason": None
-                                    }]
+                                        ),
+                                        finish_reason=None
+                                    )]
                                 )
-                                # Chunk 2: Tool call arguments
-                                yield ModelResponse(
+                                yield ModelResponseStream(
                                     id=resp_id,
-                                    object="chat.completion.chunk",
                                     created=created,
                                     model=model,
-                                    choices=[{
-                                        "index": 0,
-                                        "delta": {
-                                            "tool_calls": [{
+                                    choices=[StreamingChoices(
+                                        index=0,
+                                        delta=Delta(
+                                            tool_calls=[{
                                                 "index": current_tool_index,
                                                 "function": {
                                                     "arguments": fn_args
                                                 }
                                             }]
-                                        },
-                                        "finish_reason": None
-                                    }]
+                                        ),
+                                        finish_reason=None
+                                    )]
                                 )
                                 current_tool_index += 1
-                except:
+                except Exception as e:
                     pass
         await resp.aclose()
 
     finish_reason = "tool_calls" if has_tool_calls else "stop"
-    yield ModelResponse(
+    yield ModelResponseStream(
         id=resp_id,
-        object="chat.completion.chunk",
         created=created,
         model=model,
-        choices=[{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+        choices=[StreamingChoices(index=0, delta=Delta(), finish_reason=finish_reason)]
     )
 
-# --- 4. Monkey-patch litellm.acompletion e litellm.completion ---
+# --- 4. Monkey-patch litellm.main.acompletion e litellm.main.completion ---
 try:
-    import litellm
-
-    _orig_acompletion = litellm.acompletion
-    @functools.wraps(_orig_acompletion)
+    _orig_acompletion = litellm.main.acompletion
     async def _wrapped_acompletion(*args, **kwargs):
-        model = str(kwargs.get("model", "") or (args[0] if len(args) > 0 else ""))
-        messages = kwargs.get("messages") or (args[1] if len(args) > 1 else [])
+        # Normalizar args posicionais (model, messages) para kwargs
+        if len(args) > 0 and "model" not in kwargs:
+            kwargs["model"] = args[0]
+        if len(args) > 1 and "messages" not in kwargs:
+            kwargs["messages"] = args[1]
+        args = ()
+        model = str(kwargs.get("model", ""))
+        messages = kwargs.get("messages") or []
         
         # Google Antigravity (Gemini) Bridge
         if _is_gemini_model(model):
@@ -969,7 +1045,6 @@ try:
                 else:
                     loop = asyncio.get_event_loop()
                     content, tool_calls, pt, ct = await loop.run_in_executor(None, _call_antigravity_sync, model, messages, google_token, google_project, tools, kwargs)
-                    from litellm import ModelResponse
                     msg = {"role": "assistant"}
                     if tool_calls:
                         msg["tool_calls"] = tool_calls
@@ -996,8 +1071,7 @@ try:
                 return _stream_codex_generator(model, messages, codex_token, tools=tools, extra_kwargs=kwargs)
             else:
                 loop = asyncio.get_event_loop()
-                content, tool_calls = await loop.run_in_executor(None, _call_codex_sync, model, messages, codex_token, tools, kwargs)
-                from litellm import ModelResponse
+                content, tool_calls, pt, ct = await loop.run_in_executor(None, _call_codex_sync, model, messages, codex_token, tools, kwargs)
                 msg = {"role": "assistant"}
                 if tool_calls:
                     msg["tool_calls"] = tool_calls
@@ -1011,20 +1085,21 @@ try:
                     created=int(time.time()),
                     model=model,
                     choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
-                    usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+                    usage={"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
                 )
                 
         return await _orig_acompletion(*args, **_inject_claude_prompt(kwargs, args))
 
-    litellm.acompletion = _wrapped_acompletion
-    if hasattr(litellm, "main"):
-        litellm.main.acompletion = _wrapped_acompletion
-
-    _orig_completion = litellm.completion
-    @functools.wraps(_orig_completion)
+    _orig_completion = litellm.main.completion
     def _wrapped_completion(*args, **kwargs):
-        model = str(kwargs.get("model", "") or (args[0] if len(args) > 0 else ""))
-        messages = kwargs.get("messages") or (args[1] if len(args) > 1 else [])
+        # Normalizar args posicionais (model, messages) para kwargs
+        if len(args) > 0 and "model" not in kwargs:
+            kwargs["model"] = args[0]
+        if len(args) > 1 and "messages" not in kwargs:
+            kwargs["messages"] = args[1]
+        args = ()
+        model = str(kwargs.get("model", ""))
+        messages = kwargs.get("messages") or []
 
         # Google Antigravity (Gemini) Bridge
         if _is_gemini_model(model):
@@ -1033,7 +1108,6 @@ try:
             if google_token:
                 tools = kwargs.get("tools")
                 content, tool_calls, pt, ct = _call_antigravity_sync(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs)
-                from litellm import ModelResponse
                 msg = {"role": "assistant"}
                 if tool_calls:
                     msg["tool_calls"] = tool_calls
@@ -1056,8 +1130,7 @@ try:
             if not codex_token:
                 raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
             tools = kwargs.get("tools")
-            content, tool_calls = _call_codex_sync(model, messages, codex_token, tools=tools, extra_kwargs=kwargs)
-            from litellm import ModelResponse
+            content, tool_calls, pt, ct = _call_codex_sync(model, messages, codex_token, tools=tools, extra_kwargs=kwargs)
             msg = {"role": "assistant"}
             if tool_calls:
                 msg["tool_calls"] = tool_calls
@@ -1071,14 +1144,38 @@ try:
                 created=int(time.time()),
                 model=model,
                 choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
-                usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+                usage={"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
             )
         return _orig_completion(*args, **_inject_claude_prompt(kwargs, args))
 
+    # Atribuir nos módulos principais do litellm
+    litellm.acompletion = _wrapped_acompletion
+    litellm.main.acompletion = _wrapped_acompletion
     litellm.completion = _wrapped_completion
-    if hasattr(litellm, "main"):
-        litellm.main.completion = _wrapped_completion
+    litellm.main.completion = _wrapped_completion
 
-    print("[sitecustomize] litellm Claude Code + OpenAI Codex + Google Antigravity com Auto-Refresh ativado", file=sys.stderr)
+
+    # --- 5. Litellm Custom Callback para garantir Caching na Anthropic no nível de Proxy ---
+    try:
+        from litellm.integrations.custom_logger import CustomLogger
+        class AnthropicCacheHandler(CustomLogger):
+            def __init__(self):
+                pass
+            async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+                try:
+                    model = str(data.get("model", "")).lower()
+                    if "claude" in model or "anthropic" in model:
+                        _inject_claude_prompt(data)
+                except Exception as e:
+                    print(f"[AnthropicCacheHandler] Erro no hook: {e}", file=sys.stderr)
+                return data
+
+        _anthropic_cache_logger = AnthropicCacheHandler()
+        if _anthropic_cache_logger not in litellm.callbacks:
+            litellm.callbacks.append(_anthropic_cache_logger)
+        print("[sitecustomize] AnthropicCacheHandler registrado em litellm.callbacks com sucesso", file=sys.stderr)
+    except Exception as _cb_err:
+        print(f"[sitecustomize] Aviso ao registrar callback Anthropic: {_cb_err}", file=sys.stderr)
+    print("[sitecustomize] litellm Claude Code + OpenAI Codex + Google Antigravity com Auto-Refresh e StreamingChoices ativado", file=sys.stderr)
 except Exception as _e:
     print(f"[sitecustomize] Erro ao carregar bridges no litellm: {_e}", file=sys.stderr)
