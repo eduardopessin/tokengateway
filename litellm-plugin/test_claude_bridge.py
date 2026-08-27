@@ -6,9 +6,11 @@ source = Path(__file__).with_name("sitecustomize.py").read_text()
 module = ast.parse(source)
 wanted = {
     "_inject_claude_prompt",
-    "_is_cacheable_text_message",
+    "_anthropic_markable_message",
+    "_anthropic_cache_control",
     "_count_cache_breakpoints",
     "_mark_cache_breakpoint",
+    "_apply_conversation_cache",
 }
 functions = [
     node for node in module.body
@@ -18,9 +20,12 @@ assert len(functions) == len(wanted), f"missing: {wanted - {f.name for f in func
 constants = [
     node for node in module.body
     if isinstance(node, ast.Assign)
-    and any(getattr(t, "id", None) == "ANTHROPIC_MAX_CACHE_BREAKPOINTS" for t in node.targets)
+    and any(
+        getattr(t, "id", "").startswith(("ANTHROPIC_CACHE", "_ANTHROPIC_UNCACHEABLE"))
+        for t in node.targets
+    )
 ]
-assert constants, "ANTHROPIC_MAX_CACHE_BREAKPOINTS missing"
+assert len(constants) >= 2, "cache constants missing"
 namespace = {
     "CLAUDE_CODE_PROMPT": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
     "_token_manager": type("TokenManager", (), {"get_anthropic_token": lambda self: "token"})(),
@@ -45,14 +50,19 @@ assert result["messages"][0] == {
 }
 first_user = result["messages"][1]
 assert first_user["role"] == "user"
-assert first_user["content"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
-assert first_user["content"][1] == {"type": "text", "text": "Ping"}
-# The assistant turn is the newest safe text block, so it carries the rolling
-# breakpoint; the structured tool result must stay byte-identical.
+# Reference (wSe) puts no marker on system, and (Mzr) anchors the last two
+# markable turns: here the first user turn and the assistant turn. The
+# instructions block itself stays unmarked; the marker lands on the last block.
+assert "cache_control" not in first_user["content"][0]
+assert first_user["content"][1] == {
+    "type": "text", "text": "Ping", "cache_control": {"type": "ephemeral"},
+}
 assert result["messages"][2]["content"] == [
     {"type": "text", "text": "Pong", "cache_control": {"type": "ephemeral"}}
 ]
+# The structured tool result must stay byte-identical.
 assert result["messages"][3] == request["messages"][3]
+assert namespace["_count_cache_breakpoints"](result["messages"]) == 2
 assert result["extra_headers"]["User-Agent"] == "claude-cli/2.1.246 (external, claude-desktop)"
 print("Claude bridge transformation OK")
 
@@ -86,8 +96,8 @@ print("Claude OMP-shaped max_completion_tokens parity OK")
 
 # Measured 2026-08-27: with only the static prefix marked, cache_read stayed
 # pinned at 3853 tokens whether the conversation was 3.8k or 11.5k, so the
-# cached share decayed as the session grew. A rolling tail breakpoint moved
-# cache_read to 11526/11543 on the same conversation.
+# cached share decayed as the session grew. Anchoring the tail moved cache_read
+# to 11541/11543 on the same conversation.
 agent_turn = inject({
     "model": "claude-sonnet-5",
     "messages": [
@@ -101,18 +111,53 @@ agent_turn = inject({
     ],
 })
 messages = agent_turn["messages"]
-breakpoints = namespace["_count_cache_breakpoints"](messages)
-assert breakpoints == 2, breakpoints
-# Static prefix keeps the long TTL; the rolling tail uses the 5m default
-# because it is rewritten every turn.
-assert messages[1]["content"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+# Mzr anchors the last two markable turns; the assistant tool call and the tool
+# result are not markable, so the two user turns carry the markers.
+assert namespace["_count_cache_breakpoints"](messages) == 2
 assert messages[-1]["content"] == [
     {"type": "text", "text": "latest question", "cache_control": {"type": "ephemeral"}}
 ]
+assert messages[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+# No marker carries a TTL: reference retention defaults to "short".
+assert all(
+    block.get("cache_control", {}).get("ttl") is None
+    for message in messages
+    if isinstance(message.get("content"), list)
+    for block in message["content"]
+    if isinstance(block, dict)
+)
 # Structured payloads must survive untouched.
 assert messages[2]["tool_calls"][0]["id"] == "c1"
 assert messages[2]["content"] is None
 assert messages[3] == {"role": "tool", "tool_call_id": "c1", "content": "file body"}
+
+# Reasoning blocks are never anchors (Azr skips thinking/redacted_thinking).
+thinking_tail = inject({
+    "model": "claude-sonnet-5",
+    "messages": [
+        {"role": "system", "content": "Stable instructions."},
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "answer"},
+            {"type": "thinking", "thinking": "hidden"},
+        ]},
+    ],
+})
+tail_blocks = thinking_tail["messages"][-1]["content"]
+assert tail_blocks[1].get("cache_control") is None
+assert tail_blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+# A synthetic trailing "Continue." nudge is not a useful anchor.
+nudged = inject({
+    "model": "claude-sonnet-5",
+    "messages": [
+        {"role": "system", "content": "Stable instructions."},
+        {"role": "user", "content": "real question"},
+        {"role": "assistant", "content": "partial answer"},
+        {"role": "user", "content": "Continue."},
+    ],
+})
+assert nudged["messages"][-1]["content"] == "Continue."
 
 # A tool result as the newest turn is not a candidate: the marker would corrupt
 # the schema, so the tail falls back to the newest plain-text message.

@@ -16,7 +16,15 @@ import httpx
 import litellm
 import litellm.main
 import litellm.router
-from litellm.types.utils import ModelResponse, ModelResponseStream, StreamingChoices, Delta
+from litellm.types.utils import (
+    ModelResponse,
+    ModelResponseStream,
+    StreamingChoices,
+    Delta,
+    Usage,
+    PromptTokensDetailsWrapper,
+    CompletionTokensDetailsWrapper,
+)
 
 os.environ.setdefault("GEMINI_API_KEY", "dummy-antigravity")
 os.environ.setdefault("GOOGLE_API_KEY", "dummy-antigravity")
@@ -241,20 +249,33 @@ _thought_signatures = {}
 # Anthropic OAuth validates this exact Agent SDK identity as the sole system message.
 CLAUDE_CODE_PROMPT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 
-# Anthropic allows at most 4 cache breakpoints and caches everything *up to*
-# each one. Marking only the static prefix leaves the conversation uncached, so
-# a long agent turn re-reads its whole history at full price.
-ANTHROPIC_MAX_CACHE_BREAKPOINTS = 4
+# Ported from @oh-my-pi/pi-ai (Azr/Mzr/X$s). Anthropic caches everything *up to*
+# a breakpoint, so OMP places no marker on `system` at all: two markers on the
+# last messages already cover tools + system + the whole history. Two adjacent
+# anchors (not one) keep a valid entry to extend from as the conversation grows.
+ANTHROPIC_CACHE_BREAKPOINT_MESSAGES = 2
 
-def _is_cacheable_text_message(message):
-    """True when a breakpoint can be attached without touching structured payloads.
+# X$s: retention defaults to "short", i.e. a bare ephemeral marker (5m). The 1h
+# TTL is opt-in ("long" retention on models that support it) because a 1h write
+# costs 2x base against 1.25x for 5m.
+def _anthropic_cache_control():
+    return {"type": "ephemeral"}
 
-    tool_calls and tool results carry schemas Anthropic validates; injecting a
-    marker into them corrupts the request, so they are never candidates.
+# Azr: blocks that carry reasoning are never valid anchors.
+_ANTHROPIC_UNCACHEABLE_BLOCKS = ("thinking", "redacted_thinking", "fallback")
+
+def _anthropic_markable_message(message):
+    """Whether a breakpoint can be attached without corrupting structured payloads.
+
+    Deviation from the reference, forced by the wire shape: OMP marks Anthropic
+    messages, where tool results are `tool_result` blocks inside a user turn. We
+    see the OpenAI shape, where a tool result is its own `role: "tool"` message
+    and an assistant tool call carries `content: None`. Rewriting either into a
+    text block breaks the conversion LiteLLM performs downstream.
     """
     if not isinstance(message, dict):
         return False
-    if message.get("role") not in ("user", "assistant"):
+    if message.get("role") not in ("user", "assistant", "developer"):
         return False
     if message.get("tool_calls") or message.get("tool_call_id"):
         return False
@@ -264,7 +285,7 @@ def _is_cacheable_text_message(message):
     if isinstance(content, list):
         return any(
             isinstance(block, dict)
-            and block.get("type") == "text"
+            and block.get("type") not in _ANTHROPIC_UNCACHEABLE_BLOCKS
             and str(block.get("text", "")).strip()
             for block in content
         )
@@ -281,25 +302,54 @@ def _count_cache_breakpoints(messages):
             )
     return total
 
-def _mark_cache_breakpoint(message, ttl=None):
-    """Attach an ephemeral breakpoint to the message's last text block."""
-    control = {"type": "ephemeral"}
-    if ttl:
-        control["ttl"] = ttl
+def _mark_cache_breakpoint(message):
+    """Azr: mark the last non-reasoning block; bail when one is already marked."""
+    control = _anthropic_cache_control()
     content = message.get("content")
     if isinstance(content, str):
         message["content"] = [{"type": "text", "text": content, "cache_control": control}]
         return True
-    if isinstance(content, list):
-        for block in reversed(content):
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "text"
-                and str(block.get("text", "")).strip()
-            ):
-                block["cache_control"] = control
-                return True
+    if not isinstance(content, list):
+        return False
+    for index in range(len(content) - 1, -1, -1):
+        block = content[index]
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") in _ANTHROPIC_UNCACHEABLE_BLOCKS:
+            continue
+        if block.get("cache_control") is not None:
+            return False
+        if not str(block.get("text", "")).strip():
+            continue
+        block["cache_control"] = control
+        return True
     return False
+
+def _apply_conversation_cache(messages):
+    """Mzr: anchor breakpoints on the last markable messages."""
+    anchors = [i for i, m in enumerate(messages) if _anthropic_markable_message(m)]
+    if not anchors:
+        return 0
+    # A trailing synthetic "Continue." nudge is not a useful anchor.
+    last = messages[anchors[-1]]
+    if (
+        last.get("role") == "user"
+        and last.get("content") == "Continue."
+        and len(anchors) > 1
+    ):
+        anchors = anchors[:-1]
+    marked = 0
+    for index in reversed(anchors[-ANTHROPIC_CACHE_BREAKPOINT_MESSAGES:]):
+        message = dict(messages[index])
+        if isinstance(message.get("content"), list):
+            message["content"] = [
+                dict(block) if isinstance(block, dict) else block
+                for block in message["content"]
+            ]
+        if _mark_cache_breakpoint(message):
+            messages[index] = message
+            marked += 1
+    return marked
 
 def _inject_claude_prompt(kwargs, args=None):
     model = str(kwargs.get("model", "") or (args[0] if args and len(args) > 0 else "")).lower()
@@ -391,7 +441,7 @@ def _inject_claude_prompt(kwargs, args=None):
         "content": [{"type": "text", "text": CLAUDE_CODE_PROMPT}],
     }
 
-    static_index = None
+    instructions_index = None
     if client_system_prompt:
         cached_instructions = {
             "type": "text",
@@ -400,10 +450,6 @@ def _inject_claude_prompt(kwargs, args=None):
                 f"{client_system_prompt}\n"
                 "</client_system_instructions>"
             ),
-            # Static prefix: rarely written, read every turn, so the long TTL
-            # pays for itself. The rolling tail below keeps the 5m default
-            # because it is rewritten each turn (1h writes cost 2x vs 1.25x).
-            "cache_control": {"type": "ephemeral", "ttl": "1h"},
         }
         first_user_index = next(
             (
@@ -415,7 +461,7 @@ def _inject_claude_prompt(kwargs, args=None):
         )
         if first_user_index is None:
             non_system_messages.insert(0, {"role": "user", "content": [cached_instructions]})
-            static_index = 0
+            instructions_index = 0
         else:
             first_user = dict(non_system_messages[first_user_index])
             user_content = first_user.get("content", "")
@@ -427,32 +473,20 @@ def _inject_claude_prompt(kwargs, args=None):
                     {"type": "text", "text": str(user_content)},
                 ]
             non_system_messages[first_user_index] = first_user
-            static_index = first_user_index
+            instructions_index = first_user_index
 
-    # Rolling breakpoint on the newest safe text block: without it Anthropic
-    # caches only the static prefix and every turn re-reads the whole grown
-    # conversation at full price.
-    tail_index = next(
-        (
-            index
-            for index in range(len(non_system_messages) - 1, -1, -1)
-            if _is_cacheable_text_message(non_system_messages[index])
-        ),
-        None,
-    )
-    if (
-        tail_index is not None
-        and tail_index != static_index
-        and _count_cache_breakpoints(non_system_messages) < ANTHROPIC_MAX_CACHE_BREAKPOINTS
-    ):
-        tail = dict(non_system_messages[tail_index])
-        if isinstance(tail.get("content"), list):
-            tail["content"] = [
-                dict(block) if isinstance(block, dict) else block
-                for block in tail["content"]
-            ]
-        if _mark_cache_breakpoint(tail):
-            non_system_messages[tail_index] = tail
+    if not _apply_conversation_cache(non_system_messages) and instructions_index is not None:
+        # Deviation from the reference: in the OpenAI shape a turn can end with
+        # tool results only, leaving nothing markable. OMP never hits this because
+        # Anthropic messages always end on a user/assistant turn. Fall back to the
+        # instructions block so the static prefix still gets cached.
+        fallback = dict(non_system_messages[instructions_index])
+        fallback["content"] = [
+            dict(block) if isinstance(block, dict) else block
+            for block in fallback["content"]
+        ]
+        if _mark_cache_breakpoint(fallback):
+            non_system_messages[instructions_index] = fallback
 
     kwargs["messages"] = [claude_identity] + non_system_messages
     return kwargs
@@ -587,6 +621,64 @@ def _codex_tool_choice(choice):
         return {"type": "function", "name": function["name"]}
     return choice
 
+# --- Upstream usage normalisation (ported from @oh-my-pi/pi-ai) ---
+# Both bridges answer requests themselves, so whatever they omit here is lost:
+# LiteLLM then falls back to token_counter estimates and every cache hit is
+# invisible in /spend/logs.
+def _bridge_usage(prompt_tokens, completion_tokens, cached_tokens=0, reasoning_tokens=0, total_tokens=None):
+    prompt_tokens = max(0, int(prompt_tokens or 0))
+    completion_tokens = max(0, int(completion_tokens or 0))
+    cached_tokens = max(0, int(cached_tokens or 0))
+    reasoning_tokens = max(0, int(reasoning_tokens or 0))
+    usage = Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=int(total_tokens) if total_tokens else prompt_tokens + completion_tokens,
+    )
+    if cached_tokens:
+        usage.prompt_tokens_details = PromptTokensDetailsWrapper(cached_tokens=cached_tokens)
+        # LiteLLM's spend logging reads this attribute, not the details wrapper.
+        setattr(usage, "cache_read_input_tokens", cached_tokens)
+    if reasoning_tokens:
+        usage.completion_tokens_details = CompletionTokensDetailsWrapper(
+            reasoning_tokens=reasoning_tokens
+        )
+    return usage
+
+def _google_usage(meta):
+    """omp-google-shared.ts: promptTokenCount *includes* cached tokens, so it is
+    subtracted to avoid double-counting, and thoughts count as output."""
+    cached = meta.get("cachedContentTokenCount") or 0
+    thinking = meta.get("thoughtsTokenCount") or 0
+    return _bridge_usage(
+        prompt_tokens=(meta.get("promptTokenCount") or 0) - cached,
+        completion_tokens=(meta.get("candidatesTokenCount") or 0) + thinking,
+        cached_tokens=cached,
+        reasoning_tokens=thinking,
+        total_tokens=meta.get("totalTokenCount"),
+    )
+
+def _codex_usage(meta):
+    """OMP `eRe`: unlike Google, input_tokens is not reduced by cached_tokens."""
+    details = meta.get("input_tokens_details") or {}
+    out_details = meta.get("output_tokens_details") or {}
+    cached = details.get("cached_tokens")
+    if cached is None:
+        cached = meta.get("prompt_cache_hit_tokens") or 0
+    return _bridge_usage(
+        prompt_tokens=meta.get("input_tokens") or 0,
+        completion_tokens=meta.get("output_tokens") or 0,
+        cached_tokens=cached,
+        reasoning_tokens=out_details.get("reasoning_tokens") or 0,
+        total_tokens=meta.get("total_tokens"),
+    )
+
+def _usage_chunk(model, response_id, created, usage):
+    """Final stream chunk carrying real usage; without it LiteLLM estimates."""
+    chunk = ModelResponseStream(id=response_id, created=created, model=model, choices=[])
+    setattr(chunk, "usage", usage)
+    return chunk
+
 # --- Spend logging for bridge-served responses ---
 # The Codex and Antigravity bridges answer requests themselves, so LiteLLM never
 # wraps them in CustomStreamWrapper and no success callback fires. Without this,
@@ -662,8 +754,7 @@ def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
     full_text = []
     tool_calls = []
     active_tools = {}
-    prompt_tokens = 10
-    completion_tokens = 10
+    usage_meta = {}
 
     with httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
         resp = client.send(client.build_request("POST", url, json=body, headers=headers), stream=True)
@@ -713,9 +804,7 @@ def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
                     elif etype == "response.output_text.delta":
                         full_text.append(event.get("delta", ""))
                     elif etype == "response.completed":
-                        usage = event.get("response", {}).get("usage") or {}
-                        prompt_tokens = usage.get("input_tokens", prompt_tokens)
-                        completion_tokens = usage.get("output_tokens", completion_tokens)
+                        usage_meta = event.get("response", {}).get("usage") or {}
                     elif etype in ["response.failed", "error"]:
                         err_obj = event.get("response", {}).get("error") or event.get("message") or "Unknown error"
                         raise Exception(f"OpenAI Codex stream failed: {err_obj}")
@@ -725,7 +814,7 @@ def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
                     pass
         resp.close()
 
-    return "".join(full_text), tool_calls, prompt_tokens, completion_tokens
+    return "".join(full_text), tool_calls, _codex_usage(usage_meta)
 async def _stream_codex_generator(model, messages, token, tools=None, extra_kwargs=None):
     url = "https://chatgpt.com/backend-api/codex/responses"
     body = _codex_request_body(model, messages, tools, extra_kwargs)
@@ -737,6 +826,7 @@ async def _stream_codex_generator(model, messages, token, tools=None, extra_kwar
     current_tool_index = 0
     has_tool_calls = False
     completion_status = "completed"
+    usage_meta = {}
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
         resp = await client.send(client.build_request("POST", url, json=body, headers=headers), stream=True)
@@ -847,6 +937,7 @@ async def _stream_codex_generator(model, messages, token, tools=None, extra_kwar
                     elif etype == "response.completed":
                         resp_data = event.get("response", {})
                         completion_status = resp_data.get("status", "completed")
+                        usage_meta = resp_data.get("usage") or {}
                     elif etype in ["response.failed", "error"]:
                         err_obj = event.get("response", {}).get("error") or event.get("message") or "Unknown error"
                         raise Exception(f"OpenAI Codex stream failed: {err_obj}")
@@ -855,7 +946,6 @@ async def _stream_codex_generator(model, messages, token, tools=None, extra_kwar
                         raise parse_err
                     pass
         await resp.aclose()
-
     finish_reason = "tool_calls" if has_tool_calls else ("length" if completion_status == "incomplete" else "stop")
     yield ModelResponseStream(
         id=resp_id,
@@ -863,6 +953,9 @@ async def _stream_codex_generator(model, messages, token, tools=None, extra_kwar
         model=model,
         choices=[StreamingChoices(index=0, delta=Delta(), finish_reason=finish_reason)]
     )
+    # Without a usage-bearing chunk LiteLLM falls back to token_counter estimates
+    # and every cached token stays invisible in /spend/logs.
+    yield _usage_chunk(model, resp_id, created, _codex_usage(usage_meta))
 # --- 3.2. Google Antigravity Bridge ---
 def _is_gemini_model(model_str):
     m = str(model_str).lower()
@@ -1038,8 +1131,7 @@ def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra
 
     full_text = []
     tool_calls = []
-    prompt_tokens = 10
-    completion_tokens = 10
+    usage_meta = {}
 
     with httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
         resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
@@ -1092,13 +1184,12 @@ def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra
                                 })
                     usage = resp_obj.get("usageMetadata", {})
                     if usage:
-                        prompt_tokens = usage.get("promptTokenCount", prompt_tokens)
-                        completion_tokens = usage.get("candidatesTokenCount", completion_tokens)
+                        usage_meta = usage
                 except:
                     pass
         resp.close()
 
-    return "".join(full_text), tool_calls, prompt_tokens, completion_tokens
+    return "".join(full_text), tool_calls, _google_usage(usage_meta)
 
 async def _stream_antigravity_generator(model, messages, token, project_id, tools=None, extra_kwargs=None):
     url = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
@@ -1114,6 +1205,7 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
     created = int(time.time())
     current_tool_index = 0
     has_tool_calls = False
+    usage_meta = {}
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0, read=600.0, write=60.0)) as client:
         resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
@@ -1144,6 +1236,7 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
                 try:
                     event = json.loads(data_str)
                     resp_obj = event.get("response", {})
+                    usage_meta = resp_obj.get("usageMetadata") or usage_meta
                     candidates = resp_obj.get("candidates", [])
                     if candidates:
                         parts = candidates[0].get("content", {}).get("parts", [])
@@ -1218,6 +1311,9 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
         model=model,
         choices=[StreamingChoices(index=0, delta=Delta(), finish_reason=finish_reason)]
     )
+    # Without a usage-bearing chunk LiteLLM falls back to token_counter estimates
+    # and every implicitly cached token stays invisible in /spend/logs.
+    yield _usage_chunk(model, resp_id, created, _google_usage(usage_meta))
 
 # --- 4. Monkey-patch litellm.main.acompletion e litellm.main.completion ---
 try:
@@ -1247,7 +1343,7 @@ try:
                     )
                 else:
                     loop = asyncio.get_event_loop()
-                    content, tool_calls, pt, ct = await loop.run_in_executor(None, _call_antigravity_sync, model, messages, google_token, google_project, tools, kwargs)
+                    content, tool_calls, usage = await loop.run_in_executor(None, _call_antigravity_sync, model, messages, google_token, google_project, tools, kwargs)
                     msg = {"role": "assistant"}
                     if tool_calls:
                         msg["tool_calls"] = tool_calls
@@ -1261,7 +1357,7 @@ try:
                         created=int(time.time()),
                         model=model,
                         choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
-                        usage={"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+                        usage=usage
                     )
                     await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
                     return response
@@ -1280,7 +1376,7 @@ try:
                 )
             else:
                 loop = asyncio.get_event_loop()
-                content, tool_calls, pt, ct = await loop.run_in_executor(None, _call_codex_sync, model, messages, codex_token, tools, kwargs)
+                content, tool_calls, usage = await loop.run_in_executor(None, _call_codex_sync, model, messages, codex_token, tools, kwargs)
                 msg = {"role": "assistant"}
                 if tool_calls:
                     msg["tool_calls"] = tool_calls
@@ -1294,7 +1390,7 @@ try:
                     created=int(time.time()),
                     model=model,
                     choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
-                    usage={"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+                    usage=usage
                 )
                 await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
                 return response
@@ -1318,7 +1414,7 @@ try:
             google_project = _token_manager.get_google_project_id()
             if google_token:
                 tools = kwargs.get("tools")
-                content, tool_calls, pt, ct = _call_antigravity_sync(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs)
+                content, tool_calls, usage = _call_antigravity_sync(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs)
                 msg = {"role": "assistant"}
                 if tool_calls:
                     msg["tool_calls"] = tool_calls
@@ -1332,7 +1428,7 @@ try:
                     created=int(time.time()),
                     model=model,
                     choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
-                    usage={"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+                    usage=usage
                 )
 
         # OpenAI Codex Bridge
@@ -1342,7 +1438,7 @@ try:
             if not codex_token:
                 raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
             tools = kwargs.get("tools")
-            content, tool_calls, pt, ct = _call_codex_sync(model, messages, codex_token, tools=tools, extra_kwargs=kwargs)
+            content, tool_calls, usage = _call_codex_sync(model, messages, codex_token, tools=tools, extra_kwargs=kwargs)
             msg = {"role": "assistant"}
             if tool_calls:
                 msg["tool_calls"] = tool_calls
@@ -1356,7 +1452,7 @@ try:
                 created=int(time.time()),
                 model=model,
                 choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
-                usage={"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+                usage=usage
             )
         return _orig_completion(*args, **_inject_claude_prompt(kwargs, args))
     # Proxy routes through Router.acompletion/completion, not necessarily the
@@ -1375,11 +1471,11 @@ try:
                         _stream_antigravity_generator(model, messages, token, project, tools=kwargs.get("tools"), extra_kwargs=kwargs),
                         logging_obj, messages, start_time,
                     )
-                content, tool_calls, prompt_tokens, completion_tokens = await asyncio.get_event_loop().run_in_executor(
+                content, tool_calls, usage = await asyncio.get_event_loop().run_in_executor(
                     None, _call_antigravity_sync, model, messages, token, project, kwargs.get("tools"), kwargs
                 )
                 message = {"role": "assistant", **({"tool_calls": tool_calls} if tool_calls else {"content": content})}
-                response = ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens})
+                response = ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage=usage)
                 await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
                 return response
         if _is_codex_model(model):
@@ -1392,11 +1488,11 @@ try:
                     _stream_codex_generator(model, messages, token, tools=kwargs.get("tools"), extra_kwargs=kwargs),
                     logging_obj, messages, start_time,
                 )
-            content, tool_calls, prompt_tokens, completion_tokens = await asyncio.get_event_loop().run_in_executor(
+            content, tool_calls, usage = await asyncio.get_event_loop().run_in_executor(
                 None, _call_codex_sync, model, messages, token, kwargs.get("tools"), kwargs
             )
             message = {"role": "assistant", **({"tool_calls": tool_calls} if tool_calls else {"content": content})}
-            response = ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens})
+            response = ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage=usage)
             await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
             return response
         return await _orig_router_acompletion(self, model=model, messages=messages, stream=stream, **kwargs)
