@@ -258,7 +258,7 @@ def _inject_claude_prompt(kwargs, args=None):
             "prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,"
             "advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11"
         )
-        extra_headers["User-Agent"] = "claude-cli/2.1.220 (external, cli)"
+        extra_headers["User-Agent"] = "claude-cli/2.1.246 (external, claude-desktop)"
 
     reasoning = kwargs.get("reasoning_effort")
     thinking = kwargs.get("thinking")
@@ -390,110 +390,139 @@ def _build_codex_headers(tok):
     if acc:
         headers["chatgpt-account-id"] = acc
     return headers
+def _content_to_text(content):
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text", "output_text")
+        )
+    return str(content) if content is not None else ""
+
+def _repair_codex_tool_pairs(items):
+    calls = {
+        item.get("call_id")
+        for item in items
+        if item.get("type") == "function_call" and item.get("call_id")
+    }
+    outputs = {
+        item.get("call_id")
+        for item in items
+        if item.get("type") == "function_call_output" and item.get("call_id")
+    }
+    repaired = []
+    for item in items:
+        call_id = item.get("call_id")
+        if item.get("type") == "function_call_output" and call_id not in calls:
+            repaired.append({
+                "type": "message",
+                "role": "assistant",
+                "content": f"[Previous tool result; call_id={call_id}]: {_content_to_text(item.get('output'))}",
+            })
+        else:
+            repaired.append(item)
+        if item.get("type") == "function_call" and call_id not in outputs:
+            repaired.append({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "[No tool output recorded: the tool call was interrupted before it produced a result.]",
+            })
+    return repaired
+
 def _messages_to_codex_input(messages):
     codex_input = []
-    for m in messages:
-        role = m.get("role", "user")
-        content = m.get("content")
-        
-        # Tratar resultados de ferramentas (role == "tool")
+    for message in messages:
+        role = message.get("role", "user")
+        content = message.get("content")
         if role == "tool":
-            tool_call_id = m.get("tool_call_id") or ""
-            text_out = str(content) if not isinstance(content, list) else "".join(
-                p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ["text", "input_text"]
-            )
             codex_input.append({
                 "type": "function_call_output",
-                "call_id": tool_call_id,
-                "output": text_out
+                "call_id": message.get("tool_call_id") or "",
+                "output": _content_to_text(content),
             })
             continue
 
-        # Extrair texto
-        if isinstance(content, list):
-            text_parts = []
-            for part in content:
-                if isinstance(part, dict):
-                    if part.get("type") in ["text", "input_text", "output_text"]:
-                        text_parts.append(part.get("text", ""))
-            content_text = "".join(text_parts)
-        else:
-            content_text = str(content) if content is not None else ""
-
+        content_text = _content_to_text(content)
         codex_role = "developer" if role == "system" else role
-        if codex_role not in ["user", "assistant", "developer"]:
+        if codex_role not in ("user", "assistant", "developer"):
             codex_role = "user"
-
-        content_type = "output_text" if codex_role == "assistant" else "input_text"
-
         if content_text:
             codex_input.append({
                 "type": "message",
                 "role": codex_role,
-                "content": [{"type": content_type, "text": content_text}]
+                "content": [{"type": "output_text" if codex_role == "assistant" else "input_text", "text": content_text}],
             })
 
-        # Tratar chamadas de ferramentas emitidas pelo assistente
-        if m.get("tool_calls"):
-            for tc in m.get("tool_calls", []):
-                func = tc.get("function") or {}
-                call_id = tc.get("id") or ""
-                fn_name = func.get("name") or ""
-                fn_args = func.get("arguments") or "{}"
-                if isinstance(fn_args, dict):
-                    fn_args = json.dumps(fn_args)
-                codex_input.append({
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": fn_name,
-                    "arguments": fn_args
-                })
-    return codex_input
+        for tool_call in message.get("tool_calls") or []:
+            function = tool_call.get("function") or {}
+            arguments = function.get("arguments") or "{}"
+            codex_input.append({
+                "type": "function_call",
+                "call_id": tool_call.get("id") or "",
+                "name": function.get("name") or "",
+                "arguments": json.dumps(arguments) if isinstance(arguments, dict) else arguments,
+            })
+    return _repair_codex_tool_pairs(codex_input)
 
 def _tools_to_codex_tools(tools):
     if not tools:
         return None
     codex_tools = []
-    for t in tools:
-        if isinstance(t, dict):
-            if t.get("type") == "function" and "function" in t:
-                fn = t["function"]
-                codex_tools.append({
-                    "type": "function",
-                    "name": fn.get("name", ""),
-                    "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters", {})
-                })
-            elif "name" in t:
-                codex_tools.append({
-                    "type": "function",
-                    "name": t.get("name", ""),
-                    "description": t.get("description", ""),
-                    "parameters": t.get("parameters", {})
-                })
-    return codex_tools if codex_tools else None
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if not function.get("name"):
+            continue
+        codex_tools.append({
+            "type": "function",
+            "name": function["name"],
+            "description": function.get("description") or "",
+            "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return codex_tools or None
+
+def _codex_tool_choice(choice):
+    if not isinstance(choice, dict):
+        return choice
+    function = choice.get("function")
+    if choice.get("type") == "function" and isinstance(function, dict) and function.get("name"):
+        return {"type": "function", "name": function["name"]}
+    return choice
+
+def _codex_request_body(model, messages, tools, extra_kwargs):
+    body = {
+        "model": model.split("/")[-1],
+        "store": False,
+        "stream": True,
+        "input": _messages_to_codex_input(messages),
+    }
+    codex_tools = _tools_to_codex_tools(tools)
+    if codex_tools:
+        body["tools"] = codex_tools
+    if extra_kwargs:
+        tool_choice = _codex_tool_choice(extra_kwargs.get("tool_choice"))
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
+        max_tokens = extra_kwargs.get("max_tokens")
+        if max_tokens is not None:
+            body["max_output_tokens"] = max_tokens
+        effort = extra_kwargs.get("reasoning_effort")
+        if effort is not None:
+            body["reasoning"] = {
+                "effort": str(effort).lower(),
+                "summary": "auto",
+                "context": "all_turns",
+            }
+        if extra_kwargs.get("service_tier") is not None:
+            body["service_tier"] = extra_kwargs["service_tier"]
+    return body
 
 def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
     url = "https://chatgpt.com/backend-api/codex/responses"
-    codex_input = _messages_to_codex_input(messages)
-    codex_tools = _tools_to_codex_tools(tools)
-    bare_model = model.split("/")[-1]
-    
-    body = {
-        "model": bare_model,
-        "store": False,
-        "stream": True,
-        "input": codex_input
-    }
-    if codex_tools:
-        body["tools"] = codex_tools
-        
-    if extra_kwargs:
-        effort = extra_kwargs.get("reasoning_effort")
-        if effort and str(effort).lower() != "none":
-            body["reasoning"] = {"effort": str(effort).lower(), "summary": "auto"}
+    body = _codex_request_body(model, messages, tools, extra_kwargs)
     headers = _build_codex_headers(token)
-    
+
     full_text = []
     tool_calls = []
     active_tools = {}
@@ -563,23 +592,7 @@ def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
     return "".join(full_text), tool_calls, prompt_tokens, completion_tokens
 async def _stream_codex_generator(model, messages, token, tools=None, extra_kwargs=None):
     url = "https://chatgpt.com/backend-api/codex/responses"
-    codex_input = _messages_to_codex_input(messages)
-    codex_tools = _tools_to_codex_tools(tools)
-    bare_model = model.split("/")[-1]
-    
-    body = {
-        "model": bare_model,
-        "store": False,
-        "stream": True,
-        "input": codex_input
-    }
-    if codex_tools:
-        body["tools"] = codex_tools
-        
-    if extra_kwargs:
-        effort = extra_kwargs.get("reasoning_effort")
-        if effort and str(effort).lower() != "none":
-            body["reasoning"] = {"effort": str(effort).lower(), "summary": "auto"}
+    body = _codex_request_body(model, messages, tools, extra_kwargs)
     headers = _build_codex_headers(token)
 
     resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -740,136 +753,138 @@ def _map_antigravity_model(model_str):
             return v
     return "gemini-2.5-flash"
 
-def _tools_to_antigravity_tools(tools):
+def _google_model_supports_function_ids(model):
+    return model.split("/")[-1].lower().startswith("gemini-3")
+
+def _google_text_parts(content):
+    if isinstance(content, list):
+        return [
+            {"text": str(part.get("text", ""))}
+            for part in content
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text", "output_text") and part.get("text")
+        ]
+    return [{"text": str(content)}] if content is not None and str(content) else []
+
+def _google_tool_choice(choice, declarations):
+    if choice in (None, "auto"):
+        return {"functionCallingConfig": {"mode": "AUTO"}}
+    if choice == "none":
+        return {"functionCallingConfig": {"mode": "NONE"}}
+    if choice in ("required", "any"):
+        return {"functionCallingConfig": {"mode": "ANY"}}
+    if isinstance(choice, dict):
+        function = choice.get("function") or choice
+        name = function.get("name") if isinstance(function, dict) else None
+        if name and any(declaration.get("name") == name for declaration in declarations):
+            return {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]}}
+    return {"functionCallingConfig": {"mode": "AUTO"}}
+
+def _tools_to_antigravity_tools(model, tools):
     if not tools:
-        return None
-    decls = []
-    for t in tools:
-        if not isinstance(t, dict):
+        return None, []
+    declarations = []
+    use_legacy_parameters = model.split("/")[-1].lower().startswith("claude-")
+    for tool in tools:
+        if not isinstance(tool, dict):
             continue
-        fn = t.get("function") if isinstance(t.get("function"), dict) else t
-        name = fn.get("name")
-        if not name or not isinstance(name, str):
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
             continue
-        decl = {
-            "name": name,
-            "description": str(fn.get("description") or "")
-        }
-        params = fn.get("parameters")
-        if params and isinstance(params, dict):
-            decl["parametersJsonSchema"] = params
-        decls.append(decl)
-    return [{"functionDeclarations": decls}] if decls else None
+        schema = function.get("parameters") or {"type": "object", "properties": {}}
+        declaration = {"name": name, "description": str(function.get("description") or "")}
+        declaration["parameters" if use_legacy_parameters else "parametersJsonSchema"] = schema
+        declarations.append(declaration)
+    return ([{"functionDeclarations": declarations}] if declarations else None), declarations
+
+def _tool_result_value(message):
+    content = message.get("content")
+    text = "".join(part.get("text", "") for part in content if isinstance(part, dict)) if isinstance(content, list) else str(content or "")
+    value = {"error" if message.get("is_error") else "output": text}
+    return value
 
 def _messages_to_antigravity_payload(model, messages, project_id, tools=None, extra_kwargs=None):
     mapped_model = _map_antigravity_model(model)
     contents = []
     system_parts = []
     tool_names = {}
-    for m in messages:
-        if m.get("tool_calls"):
-            for tc in m.get("tool_calls", []):
-                tid = tc.get("id") or ""
-                tname = (tc.get("function") or {}).get("name") or ""
-                if tid:
-                    tool_names[tid] = tname
+    supports_ids = _google_model_supports_function_ids(model)
+    for message in messages:
+        for tool_call in message.get("tool_calls") or []:
+            function = tool_call.get("function") or {}
+            call_id = (tool_call.get("id") or "").split("|", 1)[0]
+            if call_id:
+                tool_names[call_id] = function.get("name") or "tool"
 
-    for m in messages:
-        role = m.get("role", "user")
-        content = m.get("content")
-        
+    pending_tool_responses = []
+    def flush_tool_responses():
+        nonlocal pending_tool_responses
+        if pending_tool_responses:
+            contents.append({"role": "user", "parts": pending_tool_responses})
+            pending_tool_responses = []
+
+    for message in messages:
+        role = message.get("role", "user") if isinstance(message, dict) else "user"
+        if role != "tool":
+            flush_tool_responses()
+        content = message.get("content") if isinstance(message, dict) else None
         if role == "tool":
-            tool_call_id = m.get("tool_call_id") or ""
-            fn_name = m.get("name") or tool_names.get(tool_call_id) or "tool"
-            text_out = str(content) if not isinstance(content, list) else "".join(
-                p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ["text", "input_text"]
-            )
-            try:
-                resp_json = json.loads(text_out)
-                if not isinstance(resp_json, dict):
-                    resp_json = {"result": resp_json}
-            except:
-                resp_json = {"result": text_out}
-            contents.append({
-                "role": "user",
-                "parts": [{
-                    "functionResponse": {
-                        "name": fn_name,
-                        "response": resp_json
-                    }
-                }]
-            })
+            encoded_call_id = message.get("tool_call_id") or ""
+            call_id = encoded_call_id.split("|", 1)[0]
+            function_response = {
+                "name": message.get("name") or tool_names.get(call_id) or "tool",
+                "response": _tool_result_value(message),
+            }
+            if supports_ids and call_id:
+                function_response["id"] = call_id
+            pending_tool_responses.append({"functionResponse": function_response})
             continue
 
-        if isinstance(content, list):
-            text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ["text", "input_text", "output_text"]]
-            text = "".join(text_parts)
-        else:
-            text = str(content) if content is not None else ""
-
+        parts = _google_text_parts(content)
         if role == "system":
-            if text:
-                system_parts.append({"text": text})
+            system_parts.extend(parts)
         elif role == "assistant":
-            parts = []
-            if text:
-                parts.append({"text": text})
-            if m.get("tool_calls"):
-                for tc in m.get("tool_calls", []):
-                    func = tc.get("function") or {}
-                    fn_name = func.get("name") or ""
-                    fn_args = func.get("arguments") or {}
-                    if isinstance(fn_args, str):
-                        try:
-                            fn_args = json.loads(fn_args)
-                        except:
-                            fn_args = {"__raw": fn_args}
-                    
-                    tc_id = tc.get("id") or ""
-                    tsig = tc.get("thoughtSignature") or tc.get("thought_signature") or (tc_id.split("|")[1] if "|" in tc_id else None) or _thought_signatures.get(tc_id) or "skip_thought_signature_validator"
-                    fc_part = {
-                        "functionCall": {
-                            "name": fn_name,
-                            "args": fn_args
-                        },
-                        "thoughtSignature": tsig
-                    }
-                    parts.append(fc_part)
+            for tool_call in message.get("tool_calls") or []:
+                function = tool_call.get("function") or {}
+                encoded_call_id = tool_call.get("id") or ""
+                call_id, _, signature = encoded_call_id.partition("|")
+                arguments = function.get("arguments") or {}
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError:
+                        arguments = {"__raw": arguments}
+                function_call = {"name": function.get("name") or "", "args": arguments}
+                if supports_ids and call_id:
+                    function_call["id"] = call_id
+                part = {"functionCall": function_call}
+                signature = tool_call.get("thoughtSignature") or tool_call.get("thought_signature") or signature or _thought_signatures.get(call_id)
+                if signature:
+                    part["thoughtSignature"] = signature
+                parts.append(part)
             if parts:
                 contents.append({"role": "model", "parts": parts})
-        else:
-            if text:
-                contents.append({"role": "user", "parts": [{"text": text}]})
+        elif parts:
+            contents.append({"role": "user", "parts": parts})
+    flush_tool_responses()
 
-    gen_config = {"maxOutputTokens": 64000}
-    if "thinking" in str(model).lower():
-        gen_config["thinkingConfig"] = {"includeThoughts": True}
-        
-    request_obj = {
-        "contents": contents,
-        "generationConfig": gen_config,
-        "safetySettings": [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}
-        ]
-    }
+    max_tokens = (extra_kwargs or {}).get("max_tokens") or 64000
+    request_obj = {"contents": contents, "generationConfig": {"maxOutputTokens": max_tokens}}
+    if "thinking" in model.lower():
+        request_obj["generationConfig"]["thinkingConfig"] = {"includeThoughts": True}
     if system_parts:
         request_obj["systemInstruction"] = {"parts": system_parts}
-
-    antigravity_tools = _tools_to_antigravity_tools(tools)
+    antigravity_tools, declarations = _tools_to_antigravity_tools(model, tools)
     if antigravity_tools:
         request_obj["tools"] = antigravity_tools
-        request_obj["toolConfig"] = {"functionCallingConfig": {"mode": "VALIDATED"}}
-
+        request_obj["toolConfig"] = _google_tool_choice((extra_kwargs or {}).get("tool_choice"), declarations)
     return {
         "project": project_id,
         "requestId": str(uuid.uuid4()),
         "model": mapped_model,
         "userAgent": "antigravity",
         "requestType": "agent",
-        "request": request_obj
+        "request": request_obj,
     }
 
 def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra_kwargs=None):
@@ -881,7 +896,7 @@ def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra
         "Accept": "text/event-stream",
         "User-Agent": "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
     }
-    
+
     full_text = []
     tool_calls = []
     prompt_tokens = 10
@@ -1013,7 +1028,7 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
                                     _thought_signatures[call_id] = tsig
                                 fn_name = fc.get("name", "")
                                 fn_args = json.dumps(fc.get("args") or {})
-                                
+
                                 yield ModelResponseStream(
                                     id=resp_id,
                                     created=created,
@@ -1077,7 +1092,7 @@ try:
         args = ()
         model = str(kwargs.get("model", ""))
         messages = kwargs.get("messages") or []
-        
+
         # Google Antigravity (Gemini) Bridge
         if _is_gemini_model(model):
             google_token = _token_manager.get_google_token()
@@ -1131,7 +1146,7 @@ try:
                     choices=[{"index": 0, "message": msg, "finish_reason": finish_reason}],
                     usage={"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
                 )
-                
+
         return await _orig_acompletion(*args, **_inject_claude_prompt(kwargs, args))
 
     _orig_completion = litellm.main.completion

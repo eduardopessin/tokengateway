@@ -35,7 +35,7 @@ assert first_user["role"] == "user"
 assert first_user["content"][0]["cache_control"] == {"type": "ephemeral"}
 assert first_user["content"][1] == {"type": "text", "text": "Ping"}
 assert result["messages"][2:] == request["messages"][2:]
-assert result["extra_headers"]["User-Agent"] == "claude-cli/2.1.220 (external, cli)"
+assert result["extra_headers"]["User-Agent"] == "claude-cli/2.1.246 (external, claude-desktop)"
 print("Claude bridge transformation OK")
 
 thinking_request = inject({
