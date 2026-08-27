@@ -72,7 +72,7 @@ async fn start_login(provider: String, state: State<'_, Arc<OAuthState>>) -> Res
                 state_uuid
             )
         }
-        _ => return Err(format!("Provedor desconhecido: {}", provider)),
+        _ => return Err(format!("Unknown provider: {}", provider)),
     };
 
     open_browser(&auth_url)?;
@@ -172,10 +172,10 @@ async fn get_cluster_usage(
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("Falha ao contactar cluster: {}", e))?;
+        .map_err(|e| format!("Failed to contact cluster: {}", e))?;
 
     if resp.status().is_success() {
-        let val: Value = resp.json().await.map_err(|e| format!("JSON inválido: {}", e))?;
+        let val: Value = resp.json().await.map_err(|e| format!("Invalid JSON: {}", e))?;
         Ok(val)
     } else {
         Err(format!("HTTP {}", resp.status()))
@@ -189,7 +189,7 @@ async fn sync_to_cluster(
 ) -> Result<String, String> {
     let creds = state.credentials.lock().await;
     if creds.is_empty() {
-        return Err("Nenhuma credencial local para sincronizar.".to_string());
+        return Err("No local credentials to sync.".to_string());
     }
 
     let url = cluster_url.unwrap_or_else(|| CLUSTER_CREDENTIALS_URL.to_string());
@@ -201,12 +201,12 @@ async fn sync_to_cluster(
         .json(&payload)
         .send()
         .await
-        .map_err(|e| format!("Falha ao contactar cluster: {}", e))?;
+        .map_err(|e| format!("Failed to contact cluster: {}", e))?;
 
     if res.status().is_success() {
-        Ok(format!("Sincronizadas {} credenciais com o cluster com sucesso!", creds.len()))
+        Ok(format!("Successfully synced {} credentials with the cluster!", creds.len()))
     } else {
-        Err(format!("Cluster respondeu com status HTTP {}", res.status()))
+        Err(format!("Cluster responded with HTTP status {}", res.status()))
     }
 }
 

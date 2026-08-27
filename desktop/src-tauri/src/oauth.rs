@@ -128,7 +128,7 @@ async fn listen_port(port: u16, provider_id: &'static str, app: AppHandle, state
     let listener_v6 = TcpListener::bind(&addr_v6).await;
 
     if let Ok(l4) = listener_v4 {
-        println!("[OAuthListener] Escutando em http://{}", addr_v4);
+        println!("[OAuthListener] Listening on http://{}", addr_v4);
         let a = app.clone();
         let s = state.clone();
         tauri::async_runtime::spawn(async move {
@@ -136,7 +136,7 @@ async fn listen_port(port: u16, provider_id: &'static str, app: AppHandle, state
         });
     }
     if let Ok(l6) = listener_v6 {
-        println!("[OAuthListener] Escutando em http://{}", addr_v6);
+        println!("[OAuthListener] Listening on http://{}", addr_v6);
         let a = app.clone();
         let s = state.clone();
         tauri::async_runtime::spawn(async move {
@@ -184,15 +184,15 @@ async fn handle_incoming_connections(listener: TcpListener, provider_id: &'stati
                             }
                         }
                     } else {
-                        error_msg = "Nenhum código de autorização detetado no callback".to_string();
+                        error_msg = "No authorization code detected in the callback".to_string();
                     }
 
                     let html_body = if success {
                         format!(r#"<!DOCTYPE html>
-<html lang="pt">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Autenticação Concluída</title>
+  <title>Authentication Complete</title>
   <style>
     body {{ background: #0f172a; color: #f8fafc; font-family: sans-serif; display: flex; align-items: center; justify-content: center; min-height: 90vh; margin: 0; }}
     .card {{ background: #1e293b; padding: 40px 60px; border-radius: 16px; text-align: center; border: 1px solid #334155; }}
@@ -203,20 +203,20 @@ async fn handle_incoming_connections(listener: TcpListener, provider_id: &'stati
 </head>
 <body>
   <div class="card">
-    <h1>✅ Autenticação Concluída!</h1>
-    <p>O token foi capturado e sincronizado com o cluster com sucesso.</p>
+    <h1>✅ Authentication Complete!</h1>
+    <p>The token was captured and synced with the cluster successfully.</p>
     <p><strong>{}</strong></p>
-    <div class="badge">Pode fechar este separador do browser.</div>
+    <div class="badge">You can close this browser tab.</div>
   </div>
   <script>setTimeout(() => window.close(), 2500);</script>
 </body>
 </html>"#, user_email.unwrap_or_default())
                     } else {
                         format!(r#"<!DOCTYPE html>
-<html lang="pt">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Erro na Autenticação</title>
+  <title>Authentication Error</title>
   <style>
     body {{ background: #0f172a; color: #f8fafc; font-family: sans-serif; display: flex; align-items: center; justify-content: center; min-height: 90vh; margin: 0; }}
     .card {{ background: #1e293b; padding: 40px 60px; border-radius: 16px; text-align: center; border: 1px solid #ef4444; }}
@@ -227,10 +227,10 @@ async fn handle_incoming_connections(listener: TcpListener, provider_id: &'stati
 </head>
 <body>
   <div class="card">
-    <h1>❌ Falha na Autenticação</h1>
-    <p>O Quota Desktop não conseguiu validar o código de autorização.</p>
+    <h1>❌ Authentication Failed</h1>
+    <p>Quota Desktop could not validate the authorization code.</p>
     <div class="err">{}</div>
-    <p>Copie a URL da barra de endereços e cole no campo manual do Quota Desktop.</p>
+    <p>Copy the URL from the address bar and paste it into the manual field in Quota Desktop.</p>
   </div>
 </body>
 </html>"#, error_msg)
@@ -293,7 +293,7 @@ pub async fn handle_token_exchange(
         "anthropic" => exchange_anthropic(code, state_param, &verifier, &state.http_client).await?,
         "openai-codex" => exchange_openai(code, &verifier, &state.http_client).await?,
         "google-antigravity" => exchange_google(code, &state.http_client).await?,
-        _ => return Err(format!("Provedor desconhecido: {}", provider_id)),
+        _ => return Err(format!("Unknown provider: {}", provider_id)),
     };
 
     {
@@ -351,9 +351,9 @@ async fn exchange_anthropic(code: &str, state: Option<&str>, verifier: &str, cli
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Falha no pedido HTTP Anthropic: {}", e))?;
+        .map_err(|e| format!("Anthropic HTTP request failed: {}", e))?;
 
-    let res_json: Value = resp.json().await.map_err(|e| format!("Falha ao ler JSON Anthropic: {}", e))?;
+    let res_json: Value = resp.json().await.map_err(|e| format!("Failed to read Anthropic JSON: {}", e))?;
 
     let access = res_json["access_token"].as_str().ok_or("Missing access_token")?.to_string();
     let refresh = res_json["refresh_token"].as_str().unwrap_or("").to_string();
@@ -391,20 +391,20 @@ async fn exchange_openai(code: &str, verifier: &str, client: &Client) -> Result<
         .form(&params)
         .send()
         .await
-        .map_err(|e| format!("Falha no pedido HTTP OpenAI: {}", e))?;
+        .map_err(|e| format!("OpenAI HTTP request failed: {}", e))?;
 
     let status = resp.status();
-    let res_text = resp.text().await.map_err(|e| format!("Falha ao ler resposta OpenAI: {}", e))?;
+    let res_text = resp.text().await.map_err(|e| format!("Failed to read OpenAI response: {}", e))?;
     let res_json: Value = serde_json::from_str(&res_text)
-        .map_err(|_| format!("Resposta OpenAI inválida (HTTP {}): {}", status, res_text))?;
+        .map_err(|_| format!("Invalid OpenAI response (HTTP {}): {}", status, res_text))?;
 
     if !status.is_success() {
-        return Err(format!("OpenAI recusou troca (HTTP {}): {}", status, res_text));
+        return Err(format!("OpenAI rejected the exchange (HTTP {}): {}", status, res_text));
     }
 
     let access = res_json["access_token"]
         .as_str()
-        .ok_or_else(|| format!("Resposta sem access_token: {}", res_text))?
+        .ok_or_else(|| format!("Response without access_token: {}", res_text))?
         .to_string();
     let refresh = res_json["refresh_token"].as_str().unwrap_or("").to_string();
     let expires_in = res_json["expires_in"].as_u64().unwrap_or(864000);
@@ -461,15 +461,15 @@ async fn exchange_google(code: &str, client: &Client) -> Result<OAuthCredential,
         .form(&params)
         .send()
         .await
-        .map_err(|e| format!("Falha no pedido Google: {}", e))?;
+        .map_err(|e| format!("Google request failed: {}", e))?;
 
     let status = resp.status();
-    let res_text = resp.text().await.map_err(|e| format!("Falha ao ler resposta Google: {}", e))?;
+    let res_text = resp.text().await.map_err(|e| format!("Failed to read Google response: {}", e))?;
     let res_json: Value = serde_json::from_str(&res_text)
-        .map_err(|_| format!("Resposta Google inválida (HTTP {}): {}", status, res_text))?;
+        .map_err(|_| format!("Invalid Google response (HTTP {}): {}", status, res_text))?;
 
     if !status.is_success() {
-        return Err(format!("Google recusou troca (HTTP {}): {}", status, res_text));
+        return Err(format!("Google rejected the exchange (HTTP {}): {}", status, res_text));
     }
 
     let access = res_json["access_token"].as_str().ok_or("Missing access_token")?.to_string();

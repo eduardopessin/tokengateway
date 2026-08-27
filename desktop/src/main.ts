@@ -89,10 +89,10 @@ async function refreshStatus(): Promise<void> {
 
       if (st) {
         if (p.connected) {
-          st.textContent = p.email ? `Conectado (${p.email})` : 'Conectado ✅';
+          st.textContent = p.email ? `Connected (${p.email})` : 'Connected ✅';
           st.style.color = '#10b981';
         } else {
-          st.textContent = 'Não conectado';
+          st.textContent = 'Not connected';
           st.style.color = '#94a3b8';
         }
       }
@@ -104,7 +104,7 @@ async function refreshStatus(): Promise<void> {
           const mins = Math.floor((remainingMs % (1000 * 60 * 60)) / (1000 * 60));
           exp.textContent = `${hours}h ${mins}m`;
         } else {
-          exp.textContent = 'Expirado';
+          exp.textContent = 'Expired';
         }
       } else if (exp) {
         exp.textContent = '--';
@@ -117,41 +117,41 @@ async function refreshStatus(): Promise<void> {
 
 window.startLogin = async function(provider: string): Promise<void> {
   try {
-    showToast(`A abrir navegador para ${provider}...`);
+    showToast(`Opening browser for ${provider}...`);
     const authUrl = await tauriCore.invoke<string>('start_login', { provider });
     window.open(authUrl, '_blank');
   } catch (e) {
-    showToast(`Erro ao iniciar login: ${e}`);
+    showToast(`Failed to start login: ${e}`);
   }
 };
 
 window.pasteRedirect = async function(provider: string): Promise<void> {
   const input = document.getElementById(`paste-${provider}`) as HTMLInputElement | null;
   if (!input || !input.value.trim()) {
-    showToast('Por favor, cole a URL de callback primeiro.');
+    showToast('Please paste the callback URL first.');
     return;
   }
   try {
-    showToast('A processar token...');
+    showToast('Processing token...');
     await tauriCore.invoke('paste_redirect', {
       provider,
       urlOrCode: input.value.trim()
     });
     input.value = '';
-    showToast(`✅ ${provider} autenticado com sucesso!`);
+    showToast(`✅ ${provider} authenticated successfully!`);
     await refreshStatus();
   } catch (e) {
-    showToast(`Erro: ${e}`);
+    showToast(`Error: ${e}`);
   }
 };
 
 window.syncCluster = async function(): Promise<void> {
   try {
-    showToast('A sincronizar com o cluster Kubernetes...');
+    showToast('Syncing with the Kubernetes cluster...');
     const res = await tauriCore.invoke<string>('sync_to_cluster', { clusterUrl: null });
     showToast(`✅ ${res}`);
   } catch (e) {
-    showToast(`Erro de sincronização: ${e}`);
+    showToast(`Sync error: ${e}`);
   }
 };
 
@@ -161,7 +161,7 @@ window.openWebDashboard = function(): void {
 
 if (tauriEvent) {
   tauriEvent.listen<OAuthSuccessPayload>('oauth-success', (event: { payload: OAuthSuccessPayload }) => {
-    showToast(`🎉 OAuth capturado para ${event.payload.provider}!`);
+    showToast(`🎉 OAuth captured for ${event.payload.provider}!`);
     refreshStatus();
   });
 }

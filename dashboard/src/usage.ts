@@ -18,7 +18,7 @@ import { loadCredentials } from "./store";
 import type { StoredCredential } from "./store";
 
 const REQUEST_TIMEOUT_MS = 20_000;
-const CACHE_TTL_MS = 300_000; // 5 minutos de cache para evitar rate-limits na Anthropic
+const CACHE_TTL_MS = 300_000; // 5-minute cache to avoid tripping Anthropic's rate limits
 
 export interface UsageLimit {
 	id: string;
@@ -149,7 +149,7 @@ async function fetchAnthropic(credential: StoredCredential): Promise<UsageLimit[
 						}
 					} catch (e) {
 						if (isDefinitiveOAuthFailure(e)) {
-							throw new Error("Token Anthropic revogado ou expirado — refaz o login no Quota Desktop");
+							throw new Error("Anthropic token is invalid or expired — sign in again in Quota Desktop");
 						}
 					}
 				}
@@ -177,7 +177,7 @@ async function fetchAnthropic(credential: StoredCredential): Promise<UsageLimit[
 }
 
 function parseAnthropicPayload(payload: unknown): UsageLimit[] {
-	if (!isRecord(payload)) throw new Error("resposta inesperada");
+	if (!isRecord(payload)) throw new Error("unexpected response");
 
 	const limits: UsageLimit[] = [];
 
@@ -229,7 +229,7 @@ function parseAnthropicPayload(payload: unknown): UsageLimit[] {
 	}
 
 	if (limits.length === 0) {
-		throw new Error("resposta sem limites válidos");
+		throw new Error("response contained no valid limits");
 	}
 
 	return limits;
@@ -256,7 +256,7 @@ function codexRateLimitBlock(prefix: string, blockLabel: string, block: unknown)
 	const limits: UsageLimit[] = [];
 	const primary = codexWindow(`${prefix}:primary`, blockLabel, block.primary_window);
 	if (primary) limits.push(primary);
-	const secondary = codexWindow(`${prefix}:secondary`, `${blockLabel} (secundário)`, block.secondary_window);
+	const secondary = codexWindow(`${prefix}:secondary`, `${blockLabel} (secondary)`, block.secondary_window);
 	if (secondary) limits.push(secondary);
 	return limits;
 }
@@ -274,10 +274,10 @@ async function fetchCodex(credential: StoredCredential): Promise<UsageLimit[]> {
 	if (!response.ok) throw new Error(`${response.status} ${(await response.text()).slice(0, 200)}`);
 
 	const payload: unknown = await response.json();
-	if (!isRecord(payload)) throw new Error("resposta inesperada");
+	if (!isRecord(payload)) throw new Error("unexpected response");
 
 	const limits: UsageLimit[] = [
-		...codexRateLimitBlock("openai-codex", "7 dias", payload.rate_limit),
+		...codexRateLimitBlock("openai-codex", "7 days", payload.rate_limit),
 		...codexRateLimitBlock("openai-codex:review", "code review", payload.code_review_rate_limit),
 	];
 
@@ -302,7 +302,7 @@ const VENDOR_LABELS: Record<string, string> = {
 };
 
 async function fetchAntigravity(credential: StoredCredential): Promise<UsageLimit[]> {
-	if (!credential.projectId) throw new Error("sem projectId — refaz o login");
+	if (!credential.projectId) throw new Error("missing projectId - sign in again");
 
 	const response = await fetch(`${ANTIGRAVITY_ENDPOINT}/v1internal:fetchAvailableModels`, {
 		method: "POST",
@@ -318,7 +318,7 @@ async function fetchAntigravity(credential: StoredCredential): Promise<UsageLimi
 
 	const payload: unknown = await response.json();
 	const models = isRecord(payload) && isRecord(payload.models) ? payload.models : undefined;
-	if (!models) throw new Error("resposta sem 'models'");
+	if (!models) throw new Error("response has no 'models'");
 
 	const byVendor: Map<string, UsageLimit> = new Map();
 	for (const entry of Object.values(models)) {
@@ -354,7 +354,7 @@ async function fetchLocalVllm(): Promise<UsageReport | null> {
 		if (!res.ok) {
 			return {
 				provider: "local-vllm",
-				label: "vLLM Cluster Local",
+				label: "Local vLLM Cluster",
 				dashboardUrl: vllmModelsUrl,
 				email: "vLLM Instance",
 				plan: "local-gpu",
@@ -415,19 +415,19 @@ async function fetchLocalVllm(): Promise<UsageReport | null> {
 
 		return {
 			provider: "local-vllm",
-			label: "vLLM Cluster Local",
+			label: "Local vLLM Cluster",
 			dashboardUrl: vllmModelsUrl,
 			email: "vLLM Instance",
 			plan: "local-gpu",
 			limits: [
 				{
 					id: "vllm:vram_allocation",
-					label: "VRAM Alocada (Pesos+KV)",
+					label: "VRAM Allocated (Weights+KV)",
 					usedFraction: vramUsedFraction,
 				},
 				{
 					id: "vllm:kv_cache",
-					label: "KV Buffer em Uso Ativo",
+					label: "KV Buffer in Active Use",
 					usedFraction: kvUsage,
 				},
 			],
@@ -442,12 +442,12 @@ async function fetchLocalVllm(): Promise<UsageReport | null> {
 	} catch (err) {
 		return {
 			provider: "local-vllm",
-			label: "vLLM Cluster Local",
+			label: "Local vLLM Cluster",
 			dashboardUrl: vllmModelsUrl,
 			email: "vLLM Instance",
 			plan: "local-gpu",
 			limits: [],
-			error: `vLLM inacessível em ${vllmUrl}`,
+			error: `vLLM unreachable at ${vllmUrl}`,
 			fetchedAt: Date.now(),
 		};
 	}
@@ -502,7 +502,7 @@ async function fetchUptimeKuma(): Promise<UsageReport | null> {
 		if (!res.ok) {
 			report.error =
 				res.status === 401
-					? "401 — credenciais do Uptime Kuma rejeitadas em /metrics"
+					? "401 — Uptime Kuma credentials rejected at /metrics"
 					: `Uptime Kuma HTTP ${res.status}`;
 			return report;
 		}
@@ -523,14 +523,14 @@ async function fetchUptimeKuma(): Promise<UsageReport | null> {
 			const labels = parsePromLabels(line.slice(prefix.length, close));
 			const url = labels.monitor_url;
 			down.push({
-				name: labels.monitor_name || "(sem nome)",
+				name: labels.monitor_name || "(unnamed)",
 				type: labels.monitor_type,
 				url: url && /^https?:\/\//i.test(url) ? url : undefined,
 			});
 		}
 
 		const total = counts[0] + counts[1] + counts[2] + counts[3];
-		down.sort((a, b) => a.name.localeCompare(b.name, "pt"));
+		down.sort((a, b) => a.name.localeCompare(b.name));
 		report.downMonitors = down;
 		report.plan =
 			counts[0] === 0 ? "all operational" : `${counts[0]} down`;
@@ -540,7 +540,7 @@ async function fetchUptimeKuma(): Promise<UsageReport | null> {
 		return report;
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
-		report.error = `Uptime Kuma inacessível em ${base} — ${detail}`;
+		report.error = `Uptime Kuma unreachable at ${base} — ${detail}`;
 		return report;
 	}
 }
@@ -656,7 +656,7 @@ async function fetchAiAgents(): Promise<UsageReport | null> {
 	}
 
 	report.agentItems = agents;
-	report.plan = `${agents.length} agentes ativos`;
+	report.plan = `${agents.length} active agents`;
 	report.extraStats = {
 		agentsCount: agents.length,
 		...clusterStats(),
@@ -734,7 +734,7 @@ export async function fetchAllUsage(forceRefresh = false): Promise<UsageReport[]
 					const m = Math.floor(remSec / 60);
 					const s = remSec % 60;
 					const timeStr = m > 0 ? `${m}m ${s}s` : `${s}s`;
-					report.error = `Rate limited no endpoint (${config.label}) (cooldown: ${timeStr} restantes)`;
+					report.error = `Rate limited on ${config.label} endpoint (cooldown: ${timeStr} remaining)`;
 				} else {
 					report.error = msg;
 				}

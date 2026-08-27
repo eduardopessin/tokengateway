@@ -53,15 +53,15 @@ async function handleApi(req: Request, url: URL): Promise<Response> {
 	const credProviderMatch = url.pathname.match(/^\/api\/credentials\/([\w-]+)$/);
 	if (credProviderMatch && req.method === "GET") {
 		const provider = credProviderMatch[1];
-		if (!isProviderId(provider)) return Response.json({ error: "provider inválido" }, { status: 400 });
+		if (!isProviderId(provider)) return Response.json({ error: "invalid provider" }, { status: 400 });
 		const credentials = await loadCredentials();
 		const cred = credentials[provider];
-		if (!cred) return Response.json({ error: "credencial não encontrada" }, { status: 404 });
+		if (!cred) return Response.json({ error: "credential not found" }, { status: 404 });
 		return Response.json(cred);
 	}
 	if (url.pathname === "/api/credentials" && req.method === "POST") {
 		const payload: unknown = await req.json();
-		if (!isRecord(payload)) return Response.json({ error: "payload inválido" }, { status: 400 });
+		if (!isRecord(payload)) return Response.json({ error: "invalid payload" }, { status: 400 });
 		let savedCount = 0;
 		for (const [key, val] of Object.entries(payload)) {
 			if (isProviderId(key) && isRecord(val)) {
@@ -90,7 +90,7 @@ async function handleApi(req: Request, url: URL): Promise<Response> {
 	const loginMatch = url.pathname.match(/^\/api\/login\/([\w-]+)$/);
 	if (loginMatch && req.method === "POST") {
 		const provider = loginMatch[1];
-		if (!isProviderId(provider)) return Response.json({ error: "provider inválido" }, { status: 400 });
+		if (!isProviderId(provider)) return Response.json({ error: "invalid provider" }, { status: 400 });
 		try {
 			const { url: authUrl, completion } = await beginLogin(provider);
 			logins.set(provider, { url: authUrl, status: "pending" });
@@ -116,7 +116,7 @@ async function handleApi(req: Request, url: URL): Promise<Response> {
 	const codeMatch = url.pathname.match(/^\/api\/login\/([\w-]+)\/code$/);
 	if (codeMatch && req.method === "POST") {
 		const provider = codeMatch[1];
-		if (!isProviderId(provider)) return Response.json({ error: "provider inválido" }, { status: 400 });
+		if (!isProviderId(provider)) return Response.json({ error: "invalid provider" }, { status: 400 });
 		const payload: unknown = await req.json();
 		const code = isRecord(payload) ? readString(payload.code) ?? "" : "";
 		try {
@@ -134,7 +134,7 @@ async function handleApi(req: Request, url: URL): Promise<Response> {
 	const logoutMatch = url.pathname.match(/^\/api\/logout\/([\w-]+)$/);
 	if (logoutMatch && req.method === "POST") {
 		const provider = logoutMatch[1];
-		if (!isProviderId(provider)) return Response.json({ error: "provider inválido" }, { status: 400 });
+		if (!isProviderId(provider)) return Response.json({ error: "invalid provider" }, { status: 400 });
 		cancelLogin(provider);
 		logins.delete(provider);
 		await deleteCredential(provider);
@@ -190,7 +190,7 @@ async function refreshSweep(): Promise<void> {
 				if (credential.expires > deadline) return;
 				try {
 					await refreshCredential(provider, credential);
-					console.log(`[refresh] ${provider}: token renovado`);
+					console.log(`[refresh] ${provider}: token refreshed`);
 				} catch (error) {
 					const msg = error instanceof Error ? error.message : String(error);
 					if (isDefinitiveOAuthFailure(error)) {

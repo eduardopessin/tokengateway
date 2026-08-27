@@ -64,11 +64,11 @@ async function generatePkce(): Promise<{ verifier: string; challenge: string }> 
 	return { verifier, challenge: Buffer.from(digest).toString("base64url") };
 }
 
-const CALLBACK_PAGE = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Autenticado</title>
+const CALLBACK_PAGE = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Authenticated</title>
 <style>body{font-family:-apple-system,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;
 display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
 div{text-align:center}h1{font-size:1.3em;margin-bottom:8px}p{color:#8b949e;font-size:.9em}</style>
-</head><body><div><h1>Autenticado</h1><p>Podes fechar esta janela.</p></div>
+</head><body><div><h1>Authenticated</h1><p>You can close this window.</p></div>
 <script>setTimeout(()=>window.close(),1200)</script></body></html>`;
 
 /**
@@ -116,11 +116,11 @@ export async function beginLogin(providerId: ProviderId): Promise<{ url: string;
 	}
 	if (servers.length === 0) {
 		throw new Error(
-			`Não consegui abrir a porta ${config.callbackPort} (exigida pelo ${config.label}) — ${bindErrors.join("; ")}`,
+			`Could not bind port ${config.callbackPort} (required by ${config.label}) — ${bindErrors.join("; ")}`,
 		);
 	}
 
-	const timer = setTimeout(() => settle({ error: "login expirou" }), CALLBACK_TIMEOUT_MS);
+	const timer = setTimeout(() => settle({ error: "login timed out" }), CALLBACK_TIMEOUT_MS);
 	pending.set(providerId, { provider: providerId, verifier, state, redirectUri, settle, servers, timer });
 
 	const params = new URLSearchParams({
@@ -137,7 +137,7 @@ export async function beginLogin(providerId: ProviderId): Promise<{ url: string;
 		try {
 			const result = await callback;
 			if ("error" in result) throw new Error(result.error);
-			if (result.state && result.state !== state) throw new Error("state mismatch (possível CSRF)");
+			if (result.state && result.state !== state) throw new Error("state mismatch (possible CSRF)");
 			await exchangeCode(config, result.code, verifier, redirectUri, state);
 		} finally {
 			cancelLogin(providerId);
@@ -162,10 +162,10 @@ export function cancelLogin(providerId: ProviderId): void {
  */
 export async function completeLoginWithCode(providerId: ProviderId, pastedCode: string): Promise<void> {
 	const entry = pending.get(providerId);
-	if (!entry) throw new Error("Nenhum login pendente para este provider");
+	if (!entry) throw new Error("No pending login for this provider");
 	// claude.ai renders the code as `<code>#<state>`.
 	const [code, fragmentState] = pastedCode.trim().split("#");
-	if (!code) throw new Error("Código vazio");
+	if (!code) throw new Error("Empty code");
 	try {
 		await exchangeCode(
 			PROVIDERS[providerId],
@@ -188,11 +188,11 @@ interface TokenPayload {
 }
 
 function parseTokenResponse(raw: unknown): TokenPayload {
-	if (!isRecord(raw)) throw new Error("resposta de token inválida");
+	if (!isRecord(raw)) throw new Error("invalid token response");
 
 	const access = readString(raw.access_token);
 	if (!access) {
-		const detail = readString(raw.error_description) ?? readString(raw.error) ?? "sem access_token";
+		const detail = readString(raw.error_description) ?? readString(raw.error) ?? "no access_token";
 		throw new Error(detail);
 	}
 
@@ -268,7 +268,7 @@ async function exchangeCode(
 	});
 
 	const text = await response.text();
-	if (!response.ok) throw new Error(`troca de token falhou (${response.status}): ${text.slice(0, 300)}`);
+	if (!response.ok) throw new Error(`token exchange failed (${response.status}): ${text.slice(0, 300)}`);
 
 	const raw: unknown = JSON.parse(text);
 	const token = parseTokenResponse(raw);
@@ -295,7 +295,7 @@ export async function refreshCredential(
 	providerId: ProviderId,
 	credential: StoredCredential,
 ): Promise<StoredCredential> {
-	if (!credential.refresh) throw new Error(`${providerId}: sem refresh token — precisa de novo login`);
+	if (!credential.refresh) throw new Error(`${providerId}: no refresh token — a new login is required`);
 	const config = PROVIDERS[providerId];
 	const isAnthropic = providerId === "anthropic";
 
@@ -329,7 +329,7 @@ export async function refreshCredential(
 	});
 
 	const text = await response.text();
-	if (!response.ok) throw new Error(`refresh falhou (${response.status}): ${text.slice(0, 200)}`);
+	if (!response.ok) throw new Error(`refresh failed (${response.status}): ${text.slice(0, 200)}`);
 
 	const token = parseTokenResponse(JSON.parse(text));
 	const refreshed: StoredCredential = {

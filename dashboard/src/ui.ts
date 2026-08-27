@@ -1,5 +1,5 @@
 export const HTML = `<!DOCTYPE html>
-<html lang="pt">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -598,13 +598,13 @@ export const HTML = `<!DOCTYPE html>
         <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>
       </svg>
     </div>
-    <h1>AI Quota & Cluster Dashboard <span class="subtitle">Subscrições + Hardware Local</span></h1>
+    <h1>AI Quota & Cluster Dashboard <span class="subtitle">Subscriptions + Local Hardware</span></h1>
   </div>
   
   <div class="header-actions">
     <div class="live-pill">
       <div class="pulse-dot"></div>
-      <span>AO VIVO</span>
+      <span>LIVE</span>
     </div>
     <button class="primary" onclick="refresh()" id="btnRefresh">
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
@@ -616,31 +616,31 @@ export const HTML = `<!DOCTYPE html>
 <!-- Compact KPI Bar -->
 <div class="kpi-bar">
   <div class="kpi-item">
-    <span class="kpi-label">Provedores</span>
+    <span class="kpi-label">Providers</span>
     <span class="kpi-val" id="kpiProviders">3 <span style="font-size:0.75em;color:var(--text-dim)">Cloud</span> + 1 <span style="font-size:0.75em;color:var(--text-dim)">Local</span></span>
   </div>
   <div class="kpi-item">
-    <span class="kpi-label">Estado Quotas</span>
-    <span class="kpi-val" id="kpiHealth"><span style="color:var(--ok)">●</span> Saudável</span>
+    <span class="kpi-label">Quota Status</span>
+    <span class="kpi-val" id="kpiHealth"><span style="color:var(--ok)">●</span> Healthy</span>
   </div>
   <div class="kpi-item">
-    <span class="kpi-label">Próximo Reset</span>
+    <span class="kpi-label">Next Reset</span>
     <span class="kpi-val" id="kpiNextReset">--:--:--</span>
   </div>
   <div class="kpi-item">
-    <span class="kpi-label">Cluster Local</span>
+    <span class="kpi-label">Local Cluster</span>
     <span class="kpi-val" id="kpiLocalVllm" style="color:var(--nvidia)">48 GB <span style="font-size:0.75em;color:var(--text-dim)">3× 5060 Ti</span></span>
   </div>
 </div>
 
 <!-- 2-Column Responsive Cards Grid -->
 <div class="cards-grid" id="cardsContainer">
-  <div style="grid-column: 1 / -1; text-align:center; padding:30px 0;"><span class="spinner"></span> A carregar métricas...</div>
+  <div style="grid-column: 1 / -1; text-align:center; padding:30px 0;"><span class="spinner"></span> Loading metrics...</div>
 </div>
 
 <footer>
-  <div>OAuth PKCE + Auto-Refresh em <code>credentials.json</code></div>
-  <div id="lastSync">Sincronizado: --:--:--</div>
+  <div>OAuth PKCE + Auto-Refresh in <code>credentials.json</code></div>
+  <div id="lastSync">Synced: --:--:--</div>
 </footer>
 
 <script>
@@ -665,7 +665,7 @@ function esc(value) {
 function formatCountdown(targetMs) {
   if (!targetMs) return null;
   const diff = targetMs - Date.now();
-  if (diff <= 0) return "reset agora";
+  if (diff <= 0) return "reset now";
   const h = Math.floor(diff / 3600000);
   const m = Math.floor((diff % 3600000) / 60000);
   const s = Math.floor((diff % 60000) / 1000);
@@ -716,7 +716,7 @@ function updateCountdowns() {
       if (text && targetMs > Date.now()) {
         el.textContent = text;
       } else {
-        el.textContent = "a expirar...";
+        el.textContent = "expiring...";
       }
     }
   });
@@ -725,7 +725,7 @@ function updateCountdowns() {
   if (closestReset !== Infinity) {
     kpiResetEl.textContent = formatCountdown(closestReset);
   } else {
-    kpiResetEl.textContent = "Nenhum";
+    kpiResetEl.textContent = "None";
   }
 }
 
@@ -741,10 +741,10 @@ async function refresh() {
     state.providers = s.providers || [];
     state.reports = u.reports || [];
     
-    document.getElementById('lastSync').textContent = 'Sincronizado: ' + new Date().toLocaleTimeString();
+    document.getElementById('lastSync').textContent = 'Synced: ' + new Date().toLocaleTimeString();
     render();
   } catch (e) {
-    document.getElementById('cardsContainer').innerHTML = '<div class="err-box" style="grid-column:1/-1">Erro: ' + e.message + '</div>';
+    document.getElementById('cardsContainer').innerHTML = '<div class="err-box" style="grid-column:1/-1">Error: ' + e.message + '</div>';
   } finally {
     btn.disabled = false;
   }
@@ -766,7 +766,7 @@ function render() {
           <div class="logo-box \${p.id}">\${LOGOS[p.id] || ''}</div>
           <div class="provider-title">
             <span class="provider-name">\${p.label}</span>
-            <span class="provider-email">\${p.email || 'Não autenticado'}</span>
+            <span class="provider-email">\${p.email || 'Not authenticated'}</span>
           </div>
         </div>
         
@@ -785,7 +785,7 @@ function render() {
         
         if (!isVllm) {
           if (p.connected) {
-            html += \`<button class="danger" onclick="logout('\${p.id}')">desligar</button>\`;
+            html += \`<button class="danger" onclick="logout('\${p.id}')">disconnect</button>\`;
           } else {
             html += \`<button class="primary" onclick="login('\${p.id}')">Login</button>\`;
           }
@@ -795,17 +795,17 @@ function render() {
 
     if (p.login && p.login.status === 'pending') {
       html += \`<div class="pending-panel">
-        <p>Abre o URL abaixo para autorizar:</p>
+        <p>Open the URL below to authorize:</p>
         <div class="url-box">\${p.login.url}</div>
         <div class="paste-row">
-          <input id="code-\${p.id}" placeholder="Código ou code#state">
+          <input id="code-\${p.id}" placeholder="Code or code#state">
           <button class="primary" onclick="submitCode('\${p.id}')">OK</button>
         </div>
       </div>\`;
     }
 
     if (p.login && p.login.status === 'error') {
-      html += \`<div class="err-box">\${p.login.message || 'Erro no login'}</div>\`;
+      html += \`<div class="err-box">\${p.login.message || 'Login error'}</div>\`;
     }
 
     // Quotas progress bars
@@ -831,7 +831,7 @@ function render() {
     if (report && report.error) {
       if (report.cooldownUntil && report.cooldownUntil > Date.now()) {
         html += \`<div class="err-box" style="display:flex;align-items:center;justify-content:space-between;gap:6px">
-          <span>⚠️ Rate limit na consulta de quota</span>
+          <span>⚠️ Rate limited while fetching quota</span>
           <span class="countdown-badge urgent" style="font-weight:600">cooldown: <strong data-cooldown-time="\${report.cooldownUntil}">...</strong></span>
         </div>\`;
       } else {
@@ -844,7 +844,7 @@ function render() {
     if (p.connected && report && report.dashboardUrl) {
       html += \`<div class="card-footer">
         <a class="dash-link" href="\${report.dashboardUrl}" target="_blank" rel="noreferrer">
-          Dashboard Oficial ↗
+          Official Dashboard ↗
         </a>
       </div>\`;
     }
@@ -891,8 +891,8 @@ function render() {
 
         if (vllmReport.extraStats) {
           html += \`<div class="extra-stats-bar">
-            <div class="mini-stat"><span class="mini-stat-label">Ativos</span><span class="mini-stat-val" style="color:#38bdf8">\${vllmReport.extraStats.runningReqs || 0} reqs</span></div>
-            <div class="mini-stat"><span class="mini-stat-label">Fila</span><span class="mini-stat-val">\${vllmReport.extraStats.waitingReqs || 0}</span></div>
+            <div class="mini-stat"><span class="mini-stat-label">Active</span><span class="mini-stat-val" style="color:#38bdf8">\${vllmReport.extraStats.runningReqs || 0} reqs</span></div>
+            <div class="mini-stat"><span class="mini-stat-label">Queue</span><span class="mini-stat-val">\${vllmReport.extraStats.waitingReqs || 0}</span></div>
             <div class="mini-stat"><span class="mini-stat-label">Cache Hit</span><span class="mini-stat-val" style="color:#10b981">\${vllmReport.extraStats.cacheHitRate}</span></div>
             <div class="mini-stat"><span class="mini-stat-label">Tokens</span><span class="mini-stat-val">\${(vllmReport.extraStats.tokensGenerated || 0).toLocaleString()}</span></div>
           </div>\`;
@@ -925,15 +925,15 @@ function render() {
           <div class="badge-group">
             <span class="pill peak">
               <span class="pill-dot" style="background:\${downColor}"></span>
-              \${downList.length} desligado\${downList.length === 1 ? '' : 's'}
+              \${downList.length} monitor\${downList.length === 1 ? '' : 's'} down
             </span>
           </div>
         </div>
         <div class="extra-stats-bar">
-          <div class="mini-stat"><span class="mini-stat-label">Monitores</span><span class="mini-stat-val">\${stats.total || 0}</span></div>
-          <div class="mini-stat"><span class="mini-stat-label">Ligados</span><span class="mini-stat-val" style="color:var(--ok)">\${stats.up || 0}</span></div>
-          <div class="mini-stat"><span class="mini-stat-label">Desligados</span><span class="mini-stat-val" style="color:var(--bad)">\${stats.down || 0}</span></div>
-          <div class="mini-stat"><span class="mini-stat-label">Pendentes</span><span class="mini-stat-val" style="color:var(--warn)">\${stats.pending || 0}</span></div>
+          <div class="mini-stat"><span class="mini-stat-label">Monitors</span><span class="mini-stat-val">\${stats.total || 0}</span></div>
+          <div class="mini-stat"><span class="mini-stat-label">Up</span><span class="mini-stat-val" style="color:var(--ok)">\${stats.up || 0}</span></div>
+          <div class="mini-stat"><span class="mini-stat-label">Down</span><span class="mini-stat-val" style="color:var(--bad)">\${stats.down || 0}</span></div>
+          <div class="mini-stat"><span class="mini-stat-label">Pending</span><span class="mini-stat-val" style="color:var(--warn)">\${stats.pending || 0}</span></div>
         </div>\`;
 
         if (downList.length) {
@@ -950,7 +950,7 @@ function render() {
           }
           html += \`</div>\`;
         } else if (!kumaReport.error) {
-          html += \`<div class="monitor-empty">Nenhum monitor desligado</div>\`;
+          html += \`<div class="monitor-empty">No monitors down</div>\`;
         }
 
         if (kumaReport.error) {
@@ -978,13 +978,13 @@ function render() {
           <div class="badge-group">
             <span class="pill" style="background:var(--agent-bg);color:var(--agent);border:1px solid var(--agent-border)">
               <span class="pill-dot" style="background:var(--ok)"></span>
-              \${list.length} ativos
+              \${list.length} active
             </span>
           </div>
         </div>
         <div class="extra-stats-bar">
-          <div class="mini-stat"><span class="mini-stat-label">Agentes</span><span class="mini-stat-val" style="color:var(--agent)">\${stats.agentsCount ?? list.length}</span></div>
-          \${stats.k3sNodes === undefined ? '' : \`<div class="mini-stat"><span class="mini-stat-label">K3s Nós</span><span class="mini-stat-val" style="color:var(--ok)">\${esc(String(stats.k3sNodes))}</span></div>\`}
+          <div class="mini-stat"><span class="mini-stat-label">Agents</span><span class="mini-stat-val" style="color:var(--agent)">\${stats.agentsCount ?? list.length}</span></div>
+          \${stats.k3sNodes === undefined ? '' : \`<div class="mini-stat"><span class="mini-stat-label">K3s Nodes</span><span class="mini-stat-val" style="color:var(--ok)">\${esc(String(stats.k3sNodes))}</span></div>\`}
           \${stats.proxmoxVms === undefined ? '' : \`<div class="mini-stat"><span class="mini-stat-label">VMs</span><span class="mini-stat-val" style="color:#38bdf8">\${esc(String(stats.proxmoxVms))}</span></div>\`}
           <div class="mini-stat"><span class="mini-stat-label">Online</span><span class="mini-stat-val" style="color:var(--nvidia)">\${stats.activeSandboxes ?? 0}</span></div>
         </div>
@@ -1000,14 +1000,14 @@ function render() {
           </div>\`;
         }
         html += \`</div>
-        <div class="card-footer"><a class="dash-link" href="\${esc(agentsReport.dashboardUrl)}" target="_blank" rel="noreferrer">Repositório & Workflows ↗</a></div>
+        <div class="card-footer"><a class="dash-link" href="\${esc(agentsReport.dashboardUrl)}" target="_blank" rel="noreferrer">Repository & Workflows ↗</a></div>
       </div></div>\`;
   }
 
   document.getElementById('cardsContainer').innerHTML = html;
   
   if (saturatedCount > 0) {
-    document.getElementById('kpiHealth').innerHTML = \`<span style="color:var(--bad)">●</span> \${saturatedCount} Saturada\${saturatedCount>1?'s':''}\`;
+    document.getElementById('kpiHealth').innerHTML = \`<span style="color:var(--bad)">●</span> \${saturatedCount} Quota\${saturatedCount>1?'s':''} Saturated\`;
   } else {
     document.getElementById('kpiHealth').innerHTML = \`<span style="color:var(--ok)">●</span> 100% OK\`;
   }
@@ -1045,7 +1045,7 @@ async function submitCode(id) {
 }
 
 async function logout(id) {
-  if (!confirm('Remover credenciais deste provedor?')) return;
+  if (!confirm('Remove credentials for this provider?')) return;
   await fetch('/api/logout/' + id, { method: 'POST' });
   refresh();
 }

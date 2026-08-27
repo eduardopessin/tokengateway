@@ -55,9 +55,9 @@ try:
         if hasattr(_Mgr, _n):
             _wrap(_n)
             _patched.append(_n)
-    print(f"[sitecustomize] litellm mcp spec-server patch aplicado: {_patched}", file=sys.stderr)
+    print(f"[sitecustomize] litellm mcp spec-server patch applied: {_patched}", file=sys.stderr)
 except Exception as _e:
-    print(f"[sitecustomize] litellm mcp patch ignorado: {_e}", file=sys.stderr)
+    print(f"[sitecustomize] litellm mcp patch skipped: {_e}", file=sys.stderr)
 
 # --- helper: persiste tokens atomicamente em litellm-secrets E quota-dashboard-credentials ---
 def _persist_tokens_to_secret(updates: dict):
@@ -68,7 +68,7 @@ def _persist_tokens_to_secret(updates: dict):
         port = os.environ.get('KUBERNETES_SERVICE_PORT', '443')
         ctx = ssl.create_default_context(cafile=ca)
 
-        # 1. Atualizar litellm-secrets no namespace litellm
+        # 1. Update litellm-secrets in the litellm namespace
         patch = {k: base64.b64encode(v.encode()).decode() for k, v in updates.items() if v}
         if patch:
             body = json.dumps({'data': patch}).encode()
@@ -83,7 +83,7 @@ def _persist_tokens_to_secret(updates: dict):
             urllib.request.urlopen(req, context=ctx, timeout=5)
             print(f"[TokenManager] litellm-secrets persistido: {list(updates.keys())}", file=sys.stderr)
 
-        # 2. Sincronizar simultaneamente quota-dashboard-credentials no namespace quota-dashboard
+        # 2. Mirror the same values into quota-dashboard-credentials
         try:
             req_get = urllib.request.Request(
                 f'https://{host}:{port}/api/v1/namespaces/quota-dashboard/secrets/quota-dashboard-credentials',
@@ -118,12 +118,12 @@ def _persist_tokens_to_secret(updates: dict):
                 urllib.request.urlopen(req_patch_q, context=ctx, timeout=5)
                 print(f"[TokenManager] quota-dashboard-credentials sincronizado atomicamente", file=sys.stderr)
         except Exception as eq:
-            print(f"[TokenManager] Aviso: falhou sincronizar quota-dashboard-credentials: {eq}", file=sys.stderr)
+            print(f"[TokenManager] Warning: failed to sync quota-dashboard-credentials: {eq}", file=sys.stderr)
 
     except Exception as e:
-        print(f"[TokenManager] Aviso: falhou persistir secret: {e}", file=sys.stderr)
+        print(f"[TokenManager] Warning: failed to persist secret: {e}", file=sys.stderr)
 
-# --- 2. Token Manager com Auto-Refresh em memória ---
+# --- 2. Token manager with in-memory auto-refresh ---
 ANTHROPIC_CLIENT_ID = os.environ.get("ANTHROPIC_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
 CODEX_CLIENT_ID = os.environ.get("OPENAI_CODEX_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com")
@@ -171,13 +171,13 @@ class TokenManager:
                             self._anthropic_token = res.get("access_token", self._anthropic_token)
                             self._anthropic_refresh = res.get("refresh_token", self._anthropic_refresh)
                             self._last_refresh["anthropic"] = now
-                            print("[TokenManager] Anthropic token refreshed com sucesso", file=sys.stderr)
+                            print("[TokenManager] Anthropic token refreshed", file=sys.stderr)
                             _persist_tokens_to_secret({
                                 "ANTHROPIC_OAUTH_TOKEN": self._anthropic_token,
                                 "ANTHROPIC_REFRESH_TOKEN": self._anthropic_refresh
                             })
                     except Exception as e:
-                        print(f"[TokenManager] Erro ao renovar Anthropic token: {e}", file=sys.stderr)
+                        print(f"[TokenManager] Failed to refresh Anthropic token: {e}", file=sys.stderr)
             return self._anthropic_token
 
     def get_codex_token(self, force_refresh=False):
@@ -201,13 +201,13 @@ class TokenManager:
                             self._codex_token = res.get("access_token", self._codex_token)
                             self._codex_refresh = res.get("refresh_token", self._codex_refresh)
                             self._last_refresh["codex"] = now
-                            print("[TokenManager] OpenAI Codex token refreshed com sucesso", file=sys.stderr)
+                            print("[TokenManager] OpenAI Codex token refreshed", file=sys.stderr)
                             _persist_tokens_to_secret({
                                 "OPENAI_CODEX_OAUTH_TOKEN": self._codex_token,
                                 "OPENAI_CODEX_REFRESH_TOKEN": self._codex_refresh
                             })
                     except Exception as e:
-                        print(f"[TokenManager] Erro ao renovar Codex token: {e}", file=sys.stderr)
+                        print(f"[TokenManager] Failed to refresh Codex token: {e}", file=sys.stderr)
             return self._codex_token
 
     def get_google_token(self, force_refresh=False):
@@ -231,12 +231,12 @@ class TokenManager:
                             res = json.loads(resp.read().decode("utf-8"))
                             self._google_token = res.get("access_token", self._google_token)
                             self._last_refresh["google"] = now
-                            print("[TokenManager] Google Antigravity token refreshed com sucesso", file=sys.stderr)
+                            print("[TokenManager] Google Antigravity token refreshed", file=sys.stderr)
                             _persist_tokens_to_secret({
                                 "GOOGLE_ANTIGRAVITY_OAUTH_TOKEN": self._google_token
                             })
                     except Exception as e:
-                        print(f"[TokenManager] Erro ao renovar Google token: {e}", file=sys.stderr)
+                        print(f"[TokenManager] Failed to refresh Google token: {e}", file=sys.stderr)
             return self._google_token
 
     def get_google_project_id(self):
@@ -690,7 +690,7 @@ async def _emit_bridge_success(logging_obj, response, start_time, end_time):
     try:
         await logging_obj.async_success_handler(response, start_time, end_time)
     except Exception as log_err:
-        print(f"[sitecustomize] bridge spend log falhou: {log_err}", file=sys.stderr)
+        print(f"[sitecustomize] bridge spend log failed: {log_err}", file=sys.stderr)
 
 async def _logged_bridge_stream(generator, logging_obj, messages, start_time):
     """Pass bridge chunks through untouched, then emit one spend-log row.
@@ -712,7 +712,7 @@ async def _logged_bridge_stream(generator, logging_obj, messages, start_time):
         )
         await _emit_bridge_success(logging_obj, response, start_time, end_time)
     except Exception as log_err:
-        print(f"[sitecustomize] bridge stream spend log falhou: {log_err}", file=sys.stderr)
+        print(f"[sitecustomize] bridge stream spend log failed: {log_err}", file=sys.stderr)
 
 def _strip_codex_output_limits(kwargs):
     for key in ("max_tokens", "max_output_tokens", "max_completion_tokens"):
@@ -1319,7 +1319,7 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
 try:
     _orig_acompletion = litellm.main.acompletion
     async def _wrapped_acompletion(*args, **kwargs):
-        # Normalizar args posicionais (model, messages) para kwargs
+        # Normalise positional args (model, messages) into kwargs
         if len(args) > 0 and "model" not in kwargs:
             kwargs["model"] = args[0]
         if len(args) > 1 and "messages" not in kwargs:
@@ -1367,7 +1367,7 @@ try:
             _strip_codex_output_limits(kwargs)
             codex_token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
             if not codex_token:
-                raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
+                raise Exception("OpenAI Codex OAuth token unavailable or expired")
             tools = kwargs.get("tools")
             if kwargs.get("stream", False):
                 return _logged_bridge_stream(
@@ -1399,7 +1399,7 @@ try:
 
     _orig_completion = litellm.main.completion
     def _wrapped_completion(*args, **kwargs):
-        # Normalizar args posicionais (model, messages) para kwargs
+        # Normalise positional args (model, messages) into kwargs
         if len(args) > 0 and "model" not in kwargs:
             kwargs["model"] = args[0]
         if len(args) > 1 and "messages" not in kwargs:
@@ -1436,7 +1436,7 @@ try:
             _strip_codex_output_limits(kwargs)
             codex_token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
             if not codex_token:
-                raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
+                raise Exception("OpenAI Codex OAuth token unavailable or expired")
             tools = kwargs.get("tools")
             content, tool_calls, usage = _call_codex_sync(model, messages, codex_token, tools=tools, extra_kwargs=kwargs)
             msg = {"role": "assistant"}
@@ -1482,7 +1482,7 @@ try:
             _strip_codex_output_limits(kwargs)
             token = _token_manager.get_codex_token() or _token_manager.get_codex_token(force_refresh=True)
             if not token:
-                raise Exception("OpenAI Codex OAuth token não disponível ou expirado")
+                raise Exception("OpenAI Codex OAuth token unavailable or expired")
             if stream:
                 return _logged_bridge_stream(
                     _stream_codex_generator(model, messages, token, tools=kwargs.get("tools"), extra_kwargs=kwargs),
@@ -1522,14 +1522,14 @@ try:
     except Exception as _route_patch_error:
         print(f"[sitecustomize] route_request patch ignored: {_route_patch_error}", file=sys.stderr)
 
-    # Atribuir nos módulos principais do litellm
+    # Bind onto litellm's main modules
     litellm.acompletion = _wrapped_acompletion
     litellm.main.acompletion = _wrapped_acompletion
     litellm.completion = _wrapped_completion
     litellm.main.completion = _wrapped_completion
 
 
-    # --- 5. Litellm Custom Callback para garantir Caching na Anthropic no nível de Proxy ---
+    # --- 5. LiteLLM custom callback that preserves Anthropic caching at the proxy layer ---
     try:
         from litellm.integrations.custom_logger import CustomLogger
         class AnthropicCacheHandler(CustomLogger):
@@ -1543,15 +1543,15 @@ try:
                     elif _is_codex_model(model):
                         _strip_codex_output_limits(data)
                 except Exception as e:
-                    print(f"[AnthropicCacheHandler] Erro no hook: {e}", file=sys.stderr)
+                    print(f"[AnthropicCacheHandler] Hook failed: {e}", file=sys.stderr)
                 return data
 
         _anthropic_cache_logger = AnthropicCacheHandler()
         if _anthropic_cache_logger not in litellm.callbacks:
             litellm.callbacks.append(_anthropic_cache_logger)
-        print("[sitecustomize] AnthropicCacheHandler registrado em litellm.callbacks com sucesso", file=sys.stderr)
+        print("[sitecustomize] AnthropicCacheHandler registered in litellm.callbacks", file=sys.stderr)
     except Exception as _cb_err:
-        print(f"[sitecustomize] Aviso ao registrar callback Anthropic: {_cb_err}", file=sys.stderr)
-    print("[sitecustomize] litellm Claude Code + OpenAI Codex + Google Antigravity com Auto-Refresh e StreamingChoices ativado", file=sys.stderr)
+        print(f"[sitecustomize] Warning registering Anthropic callback: {_cb_err}", file=sys.stderr)
+    print("[sitecustomize] litellm Claude Code + OpenAI Codex + Google Antigravity with auto-refresh and StreamingChoices enabled", file=sys.stderr)
 except Exception as _e:
-    print(f"[sitecustomize] Erro ao carregar bridges no litellm: {_e}", file=sys.stderr)
+    print(f"[sitecustomize] Failed to load litellm bridges: {_e}", file=sys.stderr)
