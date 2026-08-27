@@ -6,7 +6,7 @@ This plugin enables transparent OAuth proxying and first-party CLI wire protocol
 
 - **OpenAI Codex Responses API (`gpt-5.*`, `codex/*`)**: Maps chat completion messages and tool schemas 1:1 with `@oh-my-pi/pi-ai` wire transformers (`input_text`, `output_text`, `function_call`, `function_call_output`), supporting async SSE streaming via `httpx` without token duplication or dropped chunks.
 - **Google Antigravity (`gemini-*`, `antigravity/*`)**: Emits `parametersJsonSchema` for OpenAPI 3.0 tool declarations, handles `functionCall` / `functionResponse`, preserves `thoughtSignature` across turns (with `skip_thought_signature_validator` fallback), and enforces `maxOutputTokens: 64000`.
-- **Anthropic Claude Max (`claude-*`)**: Injects the `CLAUDE_CODE_PROMPT` to bypass `429 Rate Limit` on subscription OAuth tokens, normalizes temperature for extended thinking (`temperature: 0` -> non-thinking fallback for background tasks), and ensures `max_tokens > budget_tokens`.
+- **Anthropic Claude Max (`claude-*`)**: Keeps the required Claude Agent SDK identity as the sole system message. Client system instructions move to a `cache_control: ephemeral` block in the first user turn, avoiding OAuth `429` rejections while preserving prompt-cache hits. Also normalizes temperature for extended thinking and ensures `max_tokens > budget_tokens`.
 - **Atomic Token Manager**: Automatically refreshes expired access tokens in memory and atomically persists them to Kubernetes Secrets (`litellm-secrets` and `quota-dashboard-credentials`).
 
 ## Installation

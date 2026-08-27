@@ -7,7 +7,7 @@ This guide explains how Quota Dashboard and LiteLLM authenticate with Anthropic 
 Anthropic utilizes OAuth 2.0 PKCE to authenticate CLI tools (like Claude Code). When you authorize:
 1. An authorization code is captured via local loopback port `54545`.
 2. An initial `access_token` (~8-hour lifetime) and a rotating single-use `refresh_token` are granted.
-3. The LiteLLM wire bridge injects the Claude Code prompt signature (`CLAUDE_CODE_PROMPT`) to allow full inference without `429 Rate Limit`.
+3. The LiteLLM wire bridge keeps the Claude Agent SDK identity as the sole system message. Client system instructions are moved to a cacheable first-user block; this avoids OAuth `429` rejections without losing prompt-cache hits.
 
 ## Authentication via Quota Desktop
 

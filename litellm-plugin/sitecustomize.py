@@ -154,7 +154,7 @@ class TokenManager:
                             headers={
                                 "Content-Type": "application/json",
                                 "anthropic-beta": "oauth-2025-04-20",
-                                "User-Agent": "anthropic-sdk-typescript/0.94.0 userOAuthProvider"
+                                "User-Agent": "anthropic-sdk-typescript/0.94.0 userOAuthProvider",
                             }
                         )
                         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -236,72 +236,128 @@ class TokenManager:
 _token_manager = TokenManager()
 _thought_signatures = {}
 
-# --- 3. Funções auxiliares para Claude Code, OpenAI Codex e Google Antigravity ---
+# --- 3. Wire protocol adapters for Claude Code, OpenAI Codex, and Google Antigravity ---
+# Anthropic OAuth validates this exact Agent SDK identity as the sole system message.
 CLAUDE_CODE_PROMPT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 
 def _inject_claude_prompt(kwargs, args=None):
     model = str(kwargs.get("model", "") or (args[0] if args and len(args) > 0 else "")).lower()
-    if "claude" in model or "anthropic" in model:
-        fresh_anthropic_token = _token_manager.get_anthropic_token()
-        if fresh_anthropic_token:
-            kwargs["api_key"] = fresh_anthropic_token
-            os.environ["ANTHROPIC_OAUTH_TOKEN"] = fresh_anthropic_token
+    if "claude" not in model and "anthropic" not in model:
+        return kwargs
 
-        extra_hdrs = kwargs.setdefault("extra_headers", {})
-        if isinstance(extra_hdrs, dict):
-            extra_hdrs["anthropic-beta"] = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11"
-            extra_hdrs["User-Agent"] = "claude-cli/2.1.220 (external, cli)"
+    fresh_anthropic_token = _token_manager.get_anthropic_token()
+    if fresh_anthropic_token:
+        kwargs["api_key"] = fresh_anthropic_token
+        os.environ["ANTHROPIC_OAUTH_TOKEN"] = fresh_anthropic_token
 
-        # Regra estrita da Anthropic: temperature só pode ser 1.0 quando thinking está ligado
-        temp = kwargs.get("temperature")
-        thinking_enabled = bool(kwargs.get("thinking"))
-        if temp is not None and float(temp) != 1.0:
-            if thinking_enabled:
-                kwargs["temperature"] = 1.0
+    extra_headers = kwargs.setdefault("extra_headers", {})
+    if isinstance(extra_headers, dict):
+        extra_headers["anthropic-beta"] = (
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"
+            "redact-thinking-2026-02-12,context-management-2025-06-27,"
+            "prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,"
+            "advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11"
+        )
+        extra_headers["User-Agent"] = "claude-cli/2.1.220 (external, cli)"
+
+    reasoning = kwargs.get("reasoning_effort")
+    thinking = kwargs.get("thinking")
+    thinking_active = bool(thinking or reasoning in ("high", "medium", "low"))
+    temperature = kwargs.get("temperature")
+    if temperature is not None and float(temperature) != 1.0:
+        if thinking_active:
+            kwargs["temperature"] = 1.0
+        else:
+            kwargs.pop("reasoning_effort", None)
+            kwargs.pop("thinking", None)
+            thinking_active = False
+
+    # Claude Max reserves max_tokens against its short TPM window. Bound extended
+    # thinking requests so OMP's 64k–128k defaults do not cause an immediate 429.
+    if thinking_active:
+        if isinstance(thinking, dict):
+            budget = thinking.get("budget_tokens", 4096)
+            if budget > 8192:
+                thinking["budget_tokens"] = 8192
+                budget = 8192
+        else:
+            budget = {"low": 2048, "medium": 4096, "high": 8192}.get(str(reasoning).lower(), 4096)
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            kwargs.pop("reasoning_effort", None)
+
+        max_tokens = kwargs.get("max_tokens")
+        if max_tokens is None or max_tokens > 16384:
+            kwargs["max_tokens"] = 16384
+        elif max_tokens <= budget:
+            kwargs["max_tokens"] = budget + 2048
+
+    messages = kwargs.get("messages") or (args[1] if args and len(args) > 1 else [])
+    if not isinstance(messages, list):
+        return kwargs
+
+    # Keep OAuth's required Agent SDK identity isolated in system. Anthropic returns
+    # 429 when any client instruction shares this message or appears in another system
+    # message. Move client system instructions to the first user turn and cache them.
+    system_parts = []
+    non_system_messages = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "system":
+            non_system_messages.append(message)
+            continue
+
+        content = message.get("content", "")
+        if isinstance(content, str):
+            system_parts.append(content)
+        elif isinstance(content, list):
+            system_parts.extend(
+                str(item.get("text", ""))
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+
+    client_system_prompt = "\n\n".join(
+        part.strip().replace(CLAUDE_CODE_PROMPT, "").strip()
+        for part in system_parts
+        if part.strip()
+    )
+    claude_identity = {
+        "role": "system",
+        "content": [{"type": "text", "text": CLAUDE_CODE_PROMPT}],
+    }
+
+    if client_system_prompt:
+        cached_instructions = {
+            "type": "text",
+            "text": (
+                "<client_system_instructions>\n"
+                f"{client_system_prompt}\n"
+                "</client_system_instructions>"
+            ),
+            "cache_control": {"type": "ephemeral"},
+        }
+        first_user_index = next(
+            (
+                index
+                for index, message in enumerate(non_system_messages)
+                if isinstance(message, dict) and message.get("role") == "user"
+            ),
+            None,
+        )
+        if first_user_index is None:
+            non_system_messages.insert(0, {"role": "user", "content": [cached_instructions]})
+        else:
+            first_user = dict(non_system_messages[first_user_index])
+            user_content = first_user.get("content", "")
+            if isinstance(user_content, list):
+                first_user["content"] = [cached_instructions] + list(user_content)
             else:
-                kwargs.pop("reasoning_effort", None)
-                kwargs.pop("thinking", None)
+                first_user["content"] = [
+                    cached_instructions,
+                    {"type": "text", "text": str(user_content)},
+                ]
+            non_system_messages[first_user_index] = first_user
 
-        if kwargs.get("thinking"):
-            budget = kwargs["thinking"].get("budget_tokens", 1024) if isinstance(kwargs["thinking"], dict) else 1024
-            if kwargs.get("max_tokens") is not None and kwargs["max_tokens"] <= budget:
-                kwargs["max_tokens"] = budget + 2048
-
-        messages = kwargs.get("messages") or (args[1] if args and len(args) > 1 else [])
-        if isinstance(messages, list):
-            # Consolidação limpa e determinística do System Prompt com cache_control
-            system_parts = []
-            non_system_messages = []
-            has_claude_cli_prompt = False
-
-            for m in messages:
-                if isinstance(m, dict) and m.get("role") == "system":
-                    c = m.get("content", "")
-                    if isinstance(c, str):
-                        if CLAUDE_CODE_PROMPT in c:
-                            has_claude_cli_prompt = True
-                        system_parts.append(c)
-                    elif isinstance(c, list):
-                        for item in c:
-                            if isinstance(item, dict):
-                                txt = str(item.get("text", ""))
-                                if CLAUDE_CODE_PROMPT in txt:
-                                    has_claude_cli_prompt = True
-                                system_parts.append(txt)
-                else:
-                    non_system_messages.append(m)
-
-            if not has_claude_cli_prompt:
-                system_parts.insert(0, CLAUDE_CODE_PROMPT)
-
-            merged_system_text = "\n\n".join(part.strip() for part in system_parts if part.strip())
-            consolidated_system = {
-                "role": "system",
-                "content": [{"type": "text", "text": merged_system_text, "cache_control": {"type": "ephemeral"}}]
-            }
-
-            # Preservar estritamente as mensagens de utilizador, assistente e ferramentas sem mutação de schema
-            kwargs["messages"] = [consolidated_system] + list(non_system_messages)
+    kwargs["messages"] = [claude_identity] + non_system_messages
     return kwargs
 
 # --- 3.1. OpenAI Codex Bridge ---

@@ -50,7 +50,7 @@ Developers and AI engineers pay expensive monthly subscriptions (**Claude Max** 
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │ sitecustomize.py (Wire Transformer Plugin)            │  │
 │  │                                                       │  │
-│  │ • Anthropic: Injects Claude Code system signature     │  │
+│  │ • Anthropic: Isolates Claude Agent SDK identity + caches client instructions │
 │  │ • OpenAI: 1:1 Responses API Wire (httpx AsyncStream)  │  │
 │  │ • Google: parametersJsonSchema + thoughtSignature     │  │
 │  └───────────────────────────────────────────────────────┘  │
@@ -110,7 +110,7 @@ When you complete OAuth sign-in on your workstation's web browser, the provider 
 - 🛠️ **100% OMP / OpenAI Wire Protocol Fidelity:**
   - **OpenAI Responses API (`gpt-5.*`, `codex/*`):** Maps `input_text`, `output_text`, `function_call`, `function_call_output` with async streaming.
   - **Google Cloud Code API (`gemini-*`):** Full support for `parametersJsonSchema`, `thoughtSignature` caching/bypass, and extended 64k token outputs.
-  - **Anthropic Claude (`claude-*`):** Automated `CLAUDE_CODE_PROMPT` injection (bypasses 429 rate limits) and temperature normalization for background agents.
+  - **Anthropic Claude (`claude-*`):** Isolates the required Claude Agent SDK identity in the sole system message; client instructions move to a cached first user block. This preserves prompt-cache hits and avoids OAuth `429` rejections.
 - 🖥️ **Cross-Platform Desktop Client (Tauri v2):** Lightweight system-tray application (Windows, Linux, macOS) with local loopback listeners on ports `54545`, `1455`, and `51121`.
 - ⚡ **Local Hardware Telemetry:** Real-time VRAM and KV cache monitoring for local vLLM instances (NVIDIA RTX / CUDA).
 
