@@ -1,0 +1,134 @@
+---
+# LiteLLM gateway with the sitecustomize plugin mounted on PYTHONPATH.
+#
+# Two traps this manifest exists to document:
+#
+# 1. `checksum/config` must be recomputed by hand whenever either ConfigMap
+#    changes. A ConfigMap volume update rewrites the file on disk, but
+#    sitecustomize.py has already been imported into the running interpreter,
+#    so the pod keeps serving the old plugin until it is replaced. Without a
+#    Reloader in the cluster, a static annotation never triggers a rollover:
+#
+#      sha256sum <(cat litellm-config.yaml sitecustomize.py) | cut -c1-16
+#
+# 2. The plugin is a credential consumer, never an owner. The agent
+#    (quota-dashboard or the desktop app) syncs the tokens into the Secret read
+#    here. Two independent refreshers racing on single-use rotating refresh
+#    tokens produce an `invalid_grant` loop that forces a manual re-login.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: litellm
+data:
+  config.yaml: |
+    # Copy the contents of deploy/docker/litellm-config.yaml here, or mount it
+    # from its own ConfigMap.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-plugin
+  namespace: litellm
+data:
+  sitecustomize.py: |
+    # Copy the contents of litellm-plugin/sitecustomize.py here.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: litellm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+      annotations:
+        # sha256(config.yaml + sitecustomize.py)[:16] - recompute on every
+        # change to either ConfigMap. See trap 1 above.
+        checksum/config: "0000000000000000"
+    spec:
+      serviceAccountName: litellm
+      containers:
+        - name: litellm
+          image: ghcr.io/berriai/litellm-database:v1.90.2
+          args: ["--config", "/app/config.yaml", "--port", "4000"]
+          ports:
+            - containerPort: 4000
+              name: http
+          env:
+            - name: PYTHONPATH
+              value: "/app/patch"
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: LITELLM_MASTER_KEY
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: DATABASE_URL
+            # Snapshots taken at container start. The plugin re-reads the
+            # Secret every 10s so a token the agent rotates becomes live
+            # without a rollout.
+            - name: ANTHROPIC_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: ANTHROPIC_OAUTH_TOKEN
+                  optional: true
+            - name: OPENAI_CODEX_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: OPENAI_CODEX_OAUTH_TOKEN
+                  optional: true
+            - name: GOOGLE_ANTIGRAVITY_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: GOOGLE_ANTIGRAVITY_OAUTH_TOKEN
+                  optional: true
+            - name: GOOGLE_ANTIGRAVITY_PROJECT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: GOOGLE_ANTIGRAVITY_PROJECT_ID
+                  optional: true
+            # Redeeming a Codex rate-limit reset credit spends a limited
+            # resource, so it is opt-in.
+            # - name: CODEX_AUTO_REDEEM_RESET_CREDITS
+            #   value: "1"
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+            - name: plugin
+              mountPath: /app/patch/sitecustomize.py
+              subPath: sitecustomize.py
+      volumes:
+        - name: config
+          configMap:
+            name: litellm-config
+        - name: plugin
+          configMap:
+            name: litellm-plugin
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: litellm
+spec:
+  selector:
+    app: litellm
+  ports:
+    - port: 4000
+      targetPort: http
+      name: http
