@@ -11,6 +11,8 @@ wanted = {
     "_count_cache_breakpoints",
     "_mark_cache_breakpoint",
     "_apply_conversation_cache",
+    "_normalize_effort",
+    "_is_anthropic_adaptive",
 }
 functions = [
     node for node in module.body
@@ -21,11 +23,13 @@ constants = [
     node for node in module.body
     if isinstance(node, ast.Assign)
     and any(
-        getattr(t, "id", "").startswith(("ANTHROPIC_CACHE", "_ANTHROPIC_UNCACHEABLE"))
+        getattr(t, "id", "").startswith(
+            ("ANTHROPIC_CACHE", "_ANTHROPIC_UNCACHEABLE", "_ANTHROPIC_EFFORT", "_ANTHROPIC_ADAPTIVE")
+        )
         for t in node.targets
     )
 ]
-assert len(constants) >= 2, "cache constants missing"
+assert len(constants) >= 5, "cache/thinking constants missing"
 namespace = {
     "CLAUDE_CODE_PROMPT": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
     "_token_manager": type("TokenManager", (), {"get_anthropic_token": lambda self: "token"})(),
@@ -64,18 +68,69 @@ assert result["messages"][2]["content"] == [
 assert result["messages"][3] == request["messages"][3]
 assert namespace["_count_cache_breakpoints"](result["messages"]) == 2
 assert result["extra_headers"]["User-Agent"] == "claude-cli/2.1.246 (external, claude-desktop)"
+assert result["extra_headers"]["x-app"] == "cli"
+assert result["extra_headers"]["anthropic-dangerous-direct-browser-access"] == "true"
+betas = result["extra_headers"]["anthropic-beta"]
+# redact-thinking-2026-02-12 makes Anthropic return signed thinking blocks with
+# no text: measured on claude-sonnet-4-6, 74 chars of reasoning without the beta
+# and 0 with it. context-1m-2025-08-07 returns credit 429s on subscription
+# tokens, so omp leaves it out too.
+assert "redact-thinking" not in betas
+assert "context-1m" not in betas
+assert "effort-2025-11-24" in betas
 print("Claude bridge transformation OK")
 
-thinking_request = inject({
+# claude-opus-5 is an adaptive-thinking model: budget_tokens is ignored there
+# and Anthropic's display default is "omitted", which returns an empty thinking
+# block. Measured on claude-opus-5: 225 chars with display="summarized", 0 with
+# "omitted".
+adaptive_request = inject({
     "model": "claude-opus-5",
+    "reasoning_effort": "high",
+    "max_tokens": 128000,
+    "messages": [{"role": "user", "content": "Think."}],
+})
+assert adaptive_request["thinking"] == {"type": "adaptive", "display": "summarized"}
+assert adaptive_request["output_config"] == {"effort": "high"}
+assert adaptive_request["max_tokens"] == 16384
+assert "reasoning_effort" not in adaptive_request
+print("Claude adaptive thinking OK")
+
+# Models up to 4.6 keep the budget shape.
+thinking_request = inject({
+    "model": "claude-sonnet-4-6",
     "reasoning_effort": "high",
     "max_tokens": 128000,
     "messages": [{"role": "user", "content": "Think."}],
 })
 assert thinking_request["thinking"] == {"type": "enabled", "budget_tokens": 8192}
 assert thinking_request["max_tokens"] == 16384
+assert "output_config" not in thinking_request
 assert "reasoning_effort" not in thinking_request
-print("Claude thinking limits OK")
+print("Claude budget thinking limits OK")
+
+# `reasoning_effort: "none"` must omit thinking entirely: the Anthropic Messages
+# API has no thinking:{type:"disabled"} shape.
+off_request = inject({
+    "model": "claude-opus-5",
+    "reasoning_effort": "none",
+    "messages": [{"role": "user", "content": "Answer."}],
+})
+assert "thinking" not in off_request
+assert "output_config" not in off_request
+print("Claude thinking off OK")
+
+# The /v1/responses route forwards `reasoning: {effort, summary}` as an object
+# in reasoning_effort. Treating it as a string put "{'effort': 'high', ...}" on
+# the wire.
+object_effort = inject({
+    "model": "claude-opus-5",
+    "reasoning_effort": {"effort": "high", "summary": "detailed"},
+    "messages": [{"role": "user", "content": "Think."}],
+})
+assert object_effort["output_config"] == {"effort": "high"}
+assert object_effort["thinking"] == {"type": "adaptive", "display": "summarized"}
+print("Claude object-shaped reasoning_effort OK")
 
 # OMP's captured wire payload uses max_completion_tokens (OpenAI-style), not
 # max_tokens; the clamp must fold it into max_tokens or the raw high value
@@ -88,7 +143,7 @@ omp_shaped_request = inject({
     "store": False,
     "messages": [{"role": "user", "content": "Think."}],
 })
-assert omp_shaped_request["thinking"] == {"type": "enabled", "budget_tokens": 8192}
+assert omp_shaped_request["thinking"] == {"type": "adaptive", "display": "summarized"}
 assert omp_shaped_request["max_tokens"] == 16384
 assert "max_completion_tokens" not in omp_shaped_request
 assert "reasoning_effort" not in omp_shaped_request
