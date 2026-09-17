@@ -12,7 +12,9 @@ import collections
 import contextvars
 import ssl
 import urllib.request
-import urllib.parse
+import urllib.parse as _url
+import mimetypes
+import re
 import threading
 import httpx
 
@@ -1761,6 +1763,131 @@ def _google_is_planning_leak(text, model=None):
     if any(marker in parsed for marker in _GOOGLE_LEAK_MARKERS):
         return True
     return "path" in parsed and "content" in parsed
+
+
+class _ThinkingLoopError(Exception):
+    """Runaway reasoning. Distinct from Exception so it crosses the handlers
+    that tolerate malformed chunks."""
+
+
+# --- Reasoning loop guard (omp ThinkingLoopDetector) ---
+# OMP watches the Gemini, DeepSeek and Grok families before every tool call and
+# kills the stream with a retryable error flagged `AIError.Flag.ThinkingLoop`.
+# The four runaway shapes and the thresholds are its own
+# (`packages/ai/src/utils/thinking-loop.ts`, described in provider-quirks.md:192):
+#   1. verbatim repetition in the tail (4096 window, >= 180 repeated chars)
+#   2. near-duplicate segments (trigram Jaccard >= 0.8 across the last 16)
+#   3. progress stall (novelty <= 0.2 over 8 consecutive segments with no new
+#      concrete anchors)
+#   4. runaway summary headers (GEMINI_HEADER_RUNAWAY_THRESHOLD = 24)
+# Validated against 8 real reasoning streams from gemini-3.8-flash-medium and
+# gemini-3.1-pro-low (328 to 2099 characters of thinking): zero false
+# positives, and the pro model emitted 3 to 5 titled summaries per turn
+# against the threshold of 24.
+_LOOP_TAIL_WINDOW = 4096
+_LOOP_TAIL_REPEAT = 180
+_LOOP_SEGMENT_WINDOW = 16
+_LOOP_TRIGRAM_JACCARD = 0.8
+_LOOP_MIN_SEGMENT_CHARS = 40
+_LOOP_STALL_SEGMENTS = 8
+_LOOP_STALL_NOVELTY = 0.2
+_LOOP_HEADER_RUNAWAY = 24
+_LOOP_HEADER = re.compile(r"^\s*(?:\*\*[^*\n]{3,}\*\*|#{1,6}\s+\S.*)\s*$", re.M)
+# Concrete anchors: paths, called identifiers, and numbers. A segment bringing
+# a new one of these is making progress, even with little new vocabulary.
+_LOOP_ANCHOR = re.compile(r"[\w./-]+\.[A-Za-z0-9]{1,8}\b|\b[A-Za-z_][\w]*\(|\b\d+\b")
+_LOOP_WORD = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
+
+def _trigrams(text):
+    squashed = re.sub(r"\s+", " ", text.strip().lower())
+    return {squashed[i:i + 3] for i in range(max(0, len(squashed) - 2))}
+
+class _ThinkingLoopDetector:
+    """Detects runaway reasoning from the text as it streams by.
+
+    Deliberate deviation from omp: there the trigger is a *retryable* error and
+    the retry layer asks again. Here there is no retry, it raises. Our generator
+    has already flushed everything that is `reasoning_content` to the client
+    (which is what makes it `meaningful`), and detection happens after 8
+    segments or 180 repeated chars -- long after the first flush. Retrying
+    would duplicate reasoning within the same stream, which omp avoids with the
+    replay-safe window we do not have here.
+    """
+
+    def __init__(self):
+        self.tail = ""
+        self.buffer = ""
+        self.segments = collections.deque(maxlen=_LOOP_SEGMENT_WINDOW)
+        self.seen_words = set()
+        self.seen_anchors = set()
+        self.stalled = 0
+        self.headers = 0
+        self.chars = 0
+
+    def feed(self, text):
+        """Returns the loop reason, or None. Never raises."""
+        if not text:
+            return None
+        self.chars += len(text)
+        self.tail = (self.tail + text)[-_LOOP_TAIL_WINDOW:]
+        reason = self._verbatim_tail()
+        if reason:
+            return reason
+        self.buffer += text
+        # A segment closes on a paragraph; that way a delta landing mid-sentence
+        # counts neither as progress nor as a stall.
+        while "\n\n" in self.buffer:
+            segment, _, self.buffer = self.buffer.partition("\n\n")
+            reason = self._close_segment(segment)
+            if reason:
+                return reason
+        return None
+
+    def _verbatim_tail(self):
+        if len(self.tail) < _LOOP_TAIL_REPEAT * 2:
+            return None
+        probe = self.tail[-_LOOP_TAIL_REPEAT:]
+        if probe.strip() and probe in self.tail[:-_LOOP_TAIL_REPEAT]:
+            return f"verbatim repetition of {_LOOP_TAIL_REPEAT} chars in the tail"
+        return None
+
+    def _close_segment(self, segment):
+        text = segment.strip()
+        if not text:
+            return None
+        if _LOOP_HEADER.match(text):
+            self.headers += 1
+            if self.headers >= _LOOP_HEADER_RUNAWAY:
+                return f"{self.headers} summary headers with no action"
+        if len(text) < _LOOP_MIN_SEGMENT_CHARS:
+            return None
+        grams = _trigrams(text)
+        if grams:
+            for previous in self.segments:
+                union = grams | previous
+                if union and len(grams & previous) / len(union) >= _LOOP_TRIGRAM_JACCARD:
+                    return "near-duplicate reasoning segments"
+        self.segments.append(grams)
+        words = set(_LOOP_WORD.findall(text.lower()))
+        anchors = set(_LOOP_ANCHOR.findall(text))
+        novelty = len(words - self.seen_words) / len(words) if words else 0.0
+        fresh_anchor = bool(anchors - self.seen_anchors)
+        self.seen_words |= words
+        self.seen_anchors |= anchors
+        if novelty <= _LOOP_STALL_NOVELTY and not fresh_anchor:
+            self.stalled += 1
+            if self.stalled >= _LOOP_STALL_SEGMENTS:
+                return (
+                    f"{self.stalled} segments with no novelty "
+                    f"(novelty {novelty:.2f} <= {_LOOP_STALL_NOVELTY})"
+                )
+        else:
+            self.stalled = 0
+        return None
+
+def _google_loop_guard(model):
+    """OMP only watches the families that actually run away; here we serve Gemini."""
+    return _ThinkingLoopDetector() if "gemini" in str(model).lower() else None
 # The account's real catalogue via :fetchAvailableModels (body {"project": ...};
 # `metadata`/`cloudaicompanionProject` return 400 on this endpoint).
 _ANTIGRAVITY_MODEL_CACHE = {"at": 0.0, "ids": (), "info": {}}
@@ -1906,14 +2033,130 @@ def _map_antigravity_model(model_str, effort=None):
 def _google_model_supports_function_ids(model):
     return model.split("/")[-1].lower().startswith("gemini-3")
 
-def _google_text_parts(content):
-    if isinstance(content, list):
-        return [
-            {"text": str(part.get("text", ""))}
-            for part in content
-            if isinstance(part, dict) and part.get("type") in ("text", "input_text", "output_text") and part.get("text")
-        ]
-    return [{"text": str(content)}] if content is not None and str(content) else []
+# Byte ceiling for inlining media. The backend accepts well beyond this, but a
+# request dragging tens of MB per turn is a latency and context-window problem,
+# not a capacity one.
+_GOOGLE_INLINE_MAX_BYTES = 12 * 1024 * 1024
+_GOOGLE_FETCH_TIMEOUT_S = 20.0
+_GOOGLE_FETCH_UA = "Mozilla/5.0 (X11; Linux x86_64) litellm-antigravity-bridge/1.0"
+_GOOGLE_DATA_URI = re.compile(r"^data:([^;,]+)(;[^,]*)?,(.*)$", re.S)
+# The URIs `fileData` accepts: the Gemini Files API and GCS. A web URL does not
+# work -- measured: `fileData` with https://upload.wikimedia.org/... returns
+# `404 Requested entity was not found`, so those have to be fetched and inlined
+# by us.
+_GOOGLE_FILE_URI_PREFIXES = ("gs://", "https://generativelanguage.googleapis.com/")
+
+def _google_inline_part(mime, raw_bytes):
+    if not raw_bytes:
+        return None
+    if len(raw_bytes) > _GOOGLE_INLINE_MAX_BYTES:
+        raise Exception(
+            f"Google Antigravity: media of {len(raw_bytes)} bytes exceeds the "
+            f"{_GOOGLE_INLINE_MAX_BYTES} limit for inlining"
+        )
+    return {
+        "inlineData": {
+            "mimeType": str(mime or "application/octet-stream"),
+            "data": base64.b64encode(raw_bytes).decode("ascii"),
+        }
+    }
+
+def _google_media_from_url(url, mime_hint=None):
+    """`inlineData` from a data URI or from an http(s) URL.
+
+    Measured on the backend: `inlineData` with bare base64 is accepted and
+    understood -- with a red image the model named the colour correctly, while
+    the same request without the image hallucinated a different colour, which
+    is what proves it actually sees it. The base64 must
+    be bare: leaving the `data:...;base64,` prefix inside the `data` field
+    returns `400 Invalid value at
+    'request.contents[0].parts[0].inline_data.data'`. And `mimeType` is
+    honoured -- a PDF inlined as `application/pdf` was read (it returned the
+    word printed on the page).
+    """
+    text = str(url or "")
+    match = _GOOGLE_DATA_URI.match(text)
+    if match:
+        mime, params, payload = match.group(1), match.group(2) or "", match.group(3)
+        if "base64" in params:
+            return _google_inline_part(mime, base64.b64decode(payload))
+        return _google_inline_part(mime, _url.unquote_to_bytes(payload))
+    if text.startswith(_GOOGLE_FILE_URI_PREFIXES):
+        return {"fileData": {"mimeType": str(mime_hint or "application/octet-stream"), "fileUri": text}}
+    if text.startswith(("http://", "https://")):
+        response = httpx.get(
+            text,
+            timeout=_GOOGLE_FETCH_TIMEOUT_S,
+            follow_redirects=True,
+            headers={"User-Agent": _GOOGLE_FETCH_UA},
+        )
+        if response.status_code != 200:
+            raise Exception(
+                f"Google Antigravity: could not fetch the media at {text[:120]} "
+                f"(HTTP {response.status_code}); the backend does not accept web "
+                f"URLs in fileData, so it has to be inlined"
+            )
+        mime = (response.headers.get("content-type") or mime_hint or "").split(";")[0].strip()
+        return _google_inline_part(mime or "application/octet-stream", response.content)
+    # Bare base64, which some clients send with no prefix.
+    if len(text) > 64 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", text or ""):
+        try:
+            return _google_inline_part(mime_hint or "image/png", base64.b64decode(text, validate=False))
+        except Exception:
+            pass
+    return None
+
+def _google_media_part(part):
+    """Converts one multimodal part from the OpenAI shape.
+
+    Before this, the Gemini part builder kept only `type in (text, input_text,
+    output_text)` and dropped everything else: a request with an image reached
+    the model carrying the text alone, and the answer talked about an image it
+    had never seen. The Codex bridge already handled this
+    (`_codex_image_part`), so the asymmetry was not intentional.
+    """
+    kind = part.get("type")
+    if kind in ("image_url", "input_image"):
+        image = part.get("image_url") or part.get("image") or part.get("url")
+        if isinstance(image, dict):
+            return _google_media_from_url(image.get("url"), image.get("mime_type"))
+        return _google_media_from_url(image)
+    if kind in ("file", "input_file", "input_document", "document"):
+        spec = part.get("file") if isinstance(part.get("file"), dict) else part
+        mime = spec.get("mime_type") or spec.get("mimeType")
+        if not mime:
+            name = str(spec.get("filename") or "")
+            mime = mimetypes.guess_type(name)[0] if name else None
+        data = spec.get("file_data") or spec.get("data")
+        if data:
+            return _google_media_from_url(data, mime)
+        uri = spec.get("file_uri") or spec.get("fileUri") or spec.get("file_id")
+        if uri:
+            return _google_media_from_url(uri, mime)
+    if kind in ("input_audio", "audio"):
+        spec = part.get("input_audio") if isinstance(part.get("input_audio"), dict) else part
+        data = spec.get("data")
+        fmt = str(spec.get("format") or "wav").lower()
+        if data:
+            return _google_media_from_url(data, f"audio/{fmt}")
+    return None
+
+def _google_content_parts(content):
+    """Parts of one turn, with text and media preserved in arrival order."""
+    if not isinstance(content, list):
+        return [{"text": str(content)}] if content is not None and str(content) else []
+    parts = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") in ("text", "input_text", "output_text"):
+            if part.get("text"):
+                parts.append({"text": str(part["text"])})
+            continue
+        media = _google_media_part(part)
+        if media:
+            parts.append(media)
+    return parts
 
 def _google_tool_choice(choice, declarations):
     # Antigravity defaults to VALIDATED (omp does the same): the backend validates
@@ -1950,10 +2193,30 @@ def _tools_to_antigravity_tools(model, tools):
     return ([{"functionDeclarations": declarations}] if declarations else None), declarations
 
 def _tool_result_value(message):
+    """The result text and the media that travels apart, in `functionResponse.parts`.
+
+    Measured: an image inside `functionResponse.parts` is seen by the model on
+    every generation this account serves -- gemini-3.8-flash, gemini-3.1-pro,
+    gemini-3.1-flash-lite, gemini-2.5-flash, gemini-2.5-flash-lite and
+    gemini-pro-agent all named the colour of a capture returned by a tool. OMP
+    only uses the inline form on Gemini 3+ and, on older models, sends the
+    image in a following user turn (`pendingToolImageParts`), because the old
+    public API rejects it; on Antigravity that is unnecessary, and it is one
+    synthetic turn less in the history.
+    """
     content = message.get("content")
-    text = "".join(part.get("text", "") for part in content if isinstance(part, dict)) if isinstance(content, list) else str(content or "")
+    if isinstance(content, list):
+        text = "".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") in (None, "text", "input_text", "output_text")
+        )
+        media = [p for p in (_google_media_part(x) for x in content if isinstance(x, dict)) if p]
+    else:
+        text = str(content or "")
+        media = []
     value = {"error" if message.get("is_error") else "output": text}
-    return value
+    return value, media
 
 def _messages_to_antigravity_payload(model, messages, project_id, tools=None, extra_kwargs=None):
     mapped_model = _map_antigravity_model(
@@ -1986,16 +2249,19 @@ def _messages_to_antigravity_payload(model, messages, project_id, tools=None, ex
         if role == "tool":
             encoded_call_id = message.get("tool_call_id") or ""
             call_id = encoded_call_id.split("|", 1)[0]
+            response_value, response_media = _tool_result_value(message)
             function_response = {
                 "name": message.get("name") or tool_names.get(call_id) or "tool",
-                "response": _tool_result_value(message),
+                "response": response_value,
             }
+            if response_media:
+                function_response["parts"] = response_media
             if supports_ids and call_id:
                 function_response["id"] = call_id
             pending_tool_responses.append({"functionResponse": function_response})
             continue
 
-        parts = _google_text_parts(content)
+        parts = _google_content_parts(content)
         if role == "system":
             system_parts.extend(parts)
         elif role == "assistant":
@@ -2115,6 +2381,7 @@ def _antigravity_collect(resp, wire_model=None):
     tool_calls = []
     usage_meta = {}
     finish_raw = None
+    loop_guard = _google_loop_guard(wire_model)
     for line in resp.iter_lines():
         line_str = line.strip()
         if not line_str.startswith("data: "):
@@ -2135,6 +2402,15 @@ def _antigravity_collect(resp, wire_model=None):
                 txt = p.get("text", "")
                 if txt:
                     if p.get("thought"):
+                        if loop_guard is not None:
+                            loop_reason = loop_guard.feed(txt)
+                            if loop_reason:
+                                raise _ThinkingLoopError(
+                                    "Google Antigravity: reasoning loop "
+                                    f"({loop_reason}) after {loop_guard.chars} chars "
+                                    f"of thinking on {wire_model}; request aborted "
+                                    "instead of billing the rest"
+                                )
                         reasoning_text.append(txt)
                     elif not _google_is_planning_leak(txt, wire_model):
                         full_text.append(txt)
@@ -2236,6 +2512,7 @@ async def _stream_antigravity_once(model, messages, token, project_id, tools=Non
     has_tool_calls = False
     usage_meta = {}
     finish_raw = None
+    loop_guard = _google_loop_guard(payload.get("model"))
 
     async with httpx.AsyncClient(timeout=_GOOGLE_TIMEOUT) as client:
         resp = await _antigravity_open_async(client, payload, headers)
@@ -2264,6 +2541,15 @@ async def _stream_antigravity_once(model, messages, token, project_id, tools=Non
                             txt = p.get("text", "")
                             if txt:
                                 is_thought = bool(p.get("thought", False))
+                                if is_thought and loop_guard is not None:
+                                    loop_reason = loop_guard.feed(txt)
+                                    if loop_reason:
+                                        raise _ThinkingLoopError(
+                                            "Google Antigravity: reasoning loop "
+                                            f"({loop_reason}) after {loop_guard.chars} chars "
+                                            f"of thinking on {payload.get('model')}; stream "
+                                            "aborted instead of billing the rest"
+                                        )
                                 if not is_thought and _google_is_planning_leak(
                                     txt, payload.get("model")
                                 ):
@@ -2324,6 +2610,10 @@ async def _stream_antigravity_once(model, messages, token, project_id, tools=Non
                                     )]
                                 )
                                 current_tool_index += 1
+                except _ThinkingLoopError:
+                    # The `except Exception` below exists to tolerate malformed
+                    # chunks; a detected loop is not a malformed chunk.
+                    raise
                 except Exception:
                     pass
         await resp.aclose()

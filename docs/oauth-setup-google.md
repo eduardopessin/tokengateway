@@ -40,3 +40,26 @@ entries the same response lists in `deprecatedModelIds` — that is how
 `-thinking` variants exist only for `gemini-2.5-flash`. There is no
 `gemini-3.8-flash-thinking` or `gemini-3.7-flash-thinking` upstream, so those
 names are refused instead of being served by `-low` under the requested name.
+
+## Multimodal Input
+
+Gemini models served through this gateway accept media as well as text. The
+accepted client part shapes are:
+
+- `image_url` with a `data:` URI — inlined as-is.
+- `image_url` with an http(s) URL — **fetched by the gateway and inlined**. The
+  upstream `fileData` field does not accept web URLs (it answers
+  `404 Requested entity was not found`), so the bytes have to travel with the
+  request.
+- `image_url` with a `gs://` or Gemini Files API URI — passed through as
+  `fileData`.
+- `file` with base64 `file_data` — inlined with the mime type you declare, so a
+  PDF sent as `application/pdf` is read as a document.
+
+A tool result (`role: "tool"`) may carry an image too: it is attached to the
+`functionResponse` and is visible to the model on every generation this account
+serves, with no extra user turn.
+
+Any single piece of media must stay under **12 MB**; above that, and on a fetch
+that fails, the request is rejected with the URL and the status rather than
+being sent without the image.

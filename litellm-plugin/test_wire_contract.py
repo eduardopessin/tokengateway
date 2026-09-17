@@ -1,9 +1,13 @@
 import ast
+import base64
 import copy
 import hashlib
 import json
+import mimetypes
+import re
 import sys
 import time
+import urllib.parse as _url
 from pathlib import Path
 
 source = Path(__file__).with_name("sitecustomize.py").read_text()
@@ -25,7 +29,10 @@ names = {
     "_codex_request_body",
     "_codex_remember_unsupported",
     "_google_model_supports_function_ids",
-    "_google_text_parts",
+    "_google_inline_part",
+    "_google_media_from_url",
+    "_google_media_part",
+    "_google_content_parts",
     "_google_tool_choice",
     "_google_is_planning_leak",
     "_google_is_flash_leak_model",
@@ -48,6 +55,10 @@ constants = [
 ]
 namespace = {
     "json": json,
+    "base64": base64,
+    "mimetypes": mimetypes,
+    "re": re,
+    "_url": _url,
     "hashlib": hashlib,
     "time": time,
     "uuid": type("Uuid", (), {
