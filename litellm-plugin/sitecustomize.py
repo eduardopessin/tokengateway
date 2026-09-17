@@ -345,23 +345,55 @@ def _normalize_effort(value):
     summary = str(summary).strip().lower() if summary else None
     return effort, summary
 
+# Measured upstream (max_tokens=2048, display="summarized", a question that
+# demands reasoning): xhigh and max are accepted and yield more output than
+# high (out=164 at high, 273 at xhigh, 275 at max), so collapsing them into
+# "high" hid two rungs that really exist.
 _ANTHROPIC_ADAPTIVE_EFFORT = {
     "minimal": "low", "low": "low", "medium": "medium",
-    "high": "high", "xhigh": "high", "max": "high",
+    "high": "high", "xhigh": "xhigh", "max": "max",
 }
-_ANTHROPIC_ADAPTIVE_MODELS = (
-    "opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "haiku-5", "fable-5", "mythos-5",
+
+# The default is adaptive, and the list enumerates who *rejects* it, not who
+# accepts it. Measured model by model (max_tokens 1024/4096,
+# display="summarized"), thinking chars returned with each shape:
+#   opus-5       adaptive  82 | budget    0   <- adaptive mandatory
+#   fable-5      adaptive  83 | budget    0   <- adaptive mandatory
+#   sonnet-5     adaptive  58 | budget   59
+#   opus-4-8     adaptive  61 | budget   62
+#   opus-4-6     adaptive 101 | budget  101
+#   sonnet-4-6   adaptive 104 | budget  105
+#   opus-4-5     adaptive 400 | budget  233   <- adaptive rejected
+#   sonnet-4-5   adaptive 400 | budget  367   <- adaptive rejected
+#   haiku-4-5    adaptive 400 | budget  413   <- adaptive rejected
+# The asymmetry is what decides the default: erring towards adaptive gives a
+# 400 "adaptive thinking is not supported on this model"; erring towards budget
+# gives a 200 with 0 chars of reasoning. This way an alias (claude-opus ->
+# opus-4-8) or a new model we have not enumerated yet falls on the side that is
+# detectable.
+_ANTHROPIC_BUDGET_ONLY_MODELS = (
+    "opus-4-5", "sonnet-4-5", "haiku-4-5",
+    "opus-4-1", "opus-4-0", "sonnet-4-1", "sonnet-4-0",
+    "3-7-sonnet", "sonnet-3-7", "3-5-sonnet", "3-5-haiku", "3-opus", "opus-3",
 )
 
 def _is_anthropic_adaptive(model):
     lowered = str(model).lower()
-    return any(marker in lowered for marker in _ANTHROPIC_ADAPTIVE_MODELS)
+    return not any(marker in lowered for marker in _ANTHROPIC_BUDGET_ONLY_MODELS)
 
 # Ported from @oh-my-pi/pi-ai (Azr/Mzr/X$s). Anthropic caches everything *up to*
 # a breakpoint, so OMP places no marker on `system` at all: two markers on the
 # last messages already cover tools + system + the whole history. Two adjacent
 # anchors (not one) keep a valid entry to extend from as the conversation grows.
 ANTHROPIC_CACHE_BREAKPOINT_MESSAGES = 2
+
+# OMP has no breakpoint ceiling because it owns the whole request and never
+# receives someone else's markers. We do: a client that does its own caching
+# arrives here with markers already placed. Measured upstream with
+# claude-sonnet-4-6: 4 markers -> 200, 5 -> 400 "A maximum of 4 blocks with
+# cache_control may be provided. Found 5." Three client markers outside our
+# tail window plus our two produced exactly that 400.
+ANTHROPIC_CACHE_BREAKPOINT_CEILING = 4
 
 # X$s: retention defaults to "short", i.e. a bare ephemeral marker (5m). The 1h
 # TTL is opt-in ("long" retention on models that support it) because a 1h write
@@ -500,8 +532,15 @@ def _apply_conversation_cache(messages):
         and len(anchors) > 1
     ):
         anchors = anchors[:-1]
+    # What the client already spent comes out of our budget; the tail is what
+    # matters to keep, so we mark back to front and stop once it is exhausted.
+    budget = ANTHROPIC_CACHE_BREAKPOINT_CEILING - _count_cache_breakpoints(messages)
+    if budget <= 0:
+        return 0
     marked = 0
     for index in reversed(anchors[-ANTHROPIC_CACHE_BREAKPOINT_MESSAGES:]):
+        if marked >= budget:
+            break
         message = dict(messages[index])
         if isinstance(message.get("content"), list):
             message["content"] = [
@@ -558,6 +597,10 @@ def _inject_claude_prompt(kwargs, args=None):
         reasoning = None
         thinking = None
     thinking_active = bool(thinking or reasoning in _ANTHROPIC_EFFORT_BUDGET)
+    # Measured: with thinking active Anthropic returns 400 for temperature != 1
+    # ("may only be set to 1 when thinking is enabled") and for top_p < 0.95
+    # ("`top_p` must be greater than or equal to 0.95 or unset"). OMP suppresses
+    # both (supportsSamplingParams); we only handled temperature.
     temperature = kwargs.get("temperature")
     if temperature is not None and float(temperature) != 1.0:
         if thinking_active:
@@ -567,10 +610,31 @@ def _inject_claude_prompt(kwargs, args=None):
             kwargs.pop("thinking", None)
             thinking_active = False
 
-    # Claude Max reserves max_tokens against its short TPM window. Bound extended
-    # thinking requests so OMP's 64k-128k defaults do not cause an immediate 429.
-    # OMP sends max_completion_tokens (OpenAI-style), not max_tokens; both must be
-    # clamped in lockstep or the uncapped key still reaches Anthropic downstream.
+    if thinking_active:
+        top_p = kwargs.get("top_p")
+        if top_p is not None and float(top_p) < 0.95:
+            kwargs.pop("top_p", None)
+
+    # A tool_choice that forces a tool is incompatible with budget thinking:
+    # measured on claude-sonnet-4-6 -> 400 "Thinking may not be enabled when
+    # tool_choice forces tool use". On adaptive models the pair is accepted
+    # (200), so it is only switched off where it actually collides, the way OMP
+    # does in disableThinkingIfToolChoiceForced.
+    _choice = kwargs.get("tool_choice")
+    _forced = (
+        isinstance(_choice, dict) and _choice.get("type") in ("any", "tool", "function")
+    ) or (isinstance(_choice, str) and _choice in ("required", "any"))
+    if thinking_active and _forced and not _is_anthropic_adaptive(model):
+        kwargs.pop("thinking", None)
+        kwargs.pop("reasoning_effort", None)
+        thinking = None
+        thinking_active = False
+
+    # OMP only ever *raises* max_tokens (ensureMaxTokensForThinking: budget +
+    # 1024); it never lowers it. Measured: max_tokens=64000 is accepted on this
+    # subscription (200), so the 16384 ceiling that used to be here truncated
+    # responses the client had asked for. Only the floor stays, plus a default
+    # for when the client sends nothing.
     if thinking_active:
         if isinstance(thinking, dict):
             budget = min(thinking.get("budget_tokens") or 4096, 8192)
@@ -588,12 +652,16 @@ def _inject_claude_prompt(kwargs, args=None):
                 "effort": _ANTHROPIC_ADAPTIVE_EFFORT.get(reasoning, "medium")
             }
 
-        for _tok_key in ("max_tokens", "max_completion_tokens"):
-            _tok_val = kwargs.get(_tok_key)
-            if _tok_val is None or _tok_val > 16384:
-                kwargs[_tok_key] = 16384
-            elif _tok_val <= budget:
-                kwargs[_tok_key] = budget + 2048
+        # Only the key the client sent is touched: filling both made the copy
+        # below overwrite the client's value with the default.
+        _tok_key = (
+            "max_completion_tokens" if "max_completion_tokens" in kwargs else "max_tokens"
+        )
+        _tok_val = kwargs.get(_tok_key)
+        if _tok_val is None:
+            kwargs[_tok_key] = 16384
+        elif _tok_val <= budget:
+            kwargs[_tok_key] = budget + 2048
         if "max_completion_tokens" in kwargs:
             kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
 
@@ -601,9 +669,13 @@ def _inject_claude_prompt(kwargs, args=None):
     if not isinstance(messages, list):
         return kwargs
 
-    # Keep OAuth's required Agent SDK identity isolated in system. Anthropic returns
-    # 429 when any client instruction shares this message or appears in another system
-    # message. Move client system instructions to the first user turn and cache them.
+    # Collect the client instructions from every system message. What Anthropic
+    # requires under OAuth is that the Agent SDK identity be the *first* system
+    # block, not that it be the only one: see the measurement next to
+    # system_blocks. A LiteLLM limitation, not ours: translate_system_message
+    # (llms/anthropic/chat/transformation.py:1686) pops every system message and
+    # joins them at the front, so the mid-conversation-system-2026-04-07 beta we
+    # send cannot be honoured from here.
     system_parts = []
     non_system_messages = []
     for message in messages:
@@ -626,56 +698,26 @@ def _inject_claude_prompt(kwargs, args=None):
         for part in system_parts
         if part.strip()
     )
-    claude_identity = {
-        "role": "system",
-        "content": [{"type": "text", "text": CLAUDE_CODE_PROMPT}],
-    }
-
-    instructions_index = None
+    # The client prompt stays in system, as a second block after the identity.
+    # Measured upstream with the OAuth token (claude-opus-5/sonnet-4-6/opus-4-8/
+    # opus-4-6, max_tokens=64):
+    #   system=[identity]         -> 200
+    #   system=[identity, client] -> 200, and the client instruction is obeyed
+    #                                (ZX9-ACK marker on all four models)
+    #   system=[client]           -> 429 rate_limit_error
+    # That is, the OAuth rejection depends on the identity being the first
+    # block, not on there being only one block. Before this we stuffed the
+    # client prompt into the first user turn inside
+    # <client_system_instructions>, which stripped it of system authority for no
+    # reason at all.
+    system_blocks = [{"type": "text", "text": CLAUDE_CODE_PROMPT}]
     if client_system_prompt:
-        cached_instructions = {
-            "type": "text",
-            "text": (
-                "<client_system_instructions>\n"
-                f"{client_system_prompt}\n"
-                "</client_system_instructions>"
-            ),
-        }
-        first_user_index = next(
-            (
-                index
-                for index, message in enumerate(non_system_messages)
-                if isinstance(message, dict) and message.get("role") == "user"
-            ),
-            None,
-        )
-        if first_user_index is None:
-            non_system_messages.insert(0, {"role": "user", "content": [cached_instructions]})
-            instructions_index = 0
-        else:
-            first_user = dict(non_system_messages[first_user_index])
-            user_content = first_user.get("content", "")
-            if isinstance(user_content, list):
-                first_user["content"] = [cached_instructions] + list(user_content)
-            else:
-                first_user["content"] = [
-                    cached_instructions,
-                    {"type": "text", "text": str(user_content)},
-                ]
-            non_system_messages[first_user_index] = first_user
-            instructions_index = first_user_index
+        system_blocks.append({"type": "text", "text": client_system_prompt})
+    claude_identity = {"role": "system", "content": system_blocks}
 
-    if not _apply_conversation_cache(non_system_messages) and instructions_index is not None:
-        # Safety net: this is only left for a conversation with no markable
-        # message at all. Now that `role: "tool"` and `tool_calls` are anchors,
-        # a real conversation always takes the normal path above.
-        fallback = dict(non_system_messages[instructions_index])
-        fallback["content"] = [
-            dict(block) if isinstance(block, dict) else block
-            for block in fallback["content"]
-        ]
-        if _mark_cache_breakpoint(fallback):
-            non_system_messages[instructions_index] = fallback
+    # wSe: nothing is marked in system; the tail anchor already covers the whole
+    # prefix.
+    _apply_conversation_cache(non_system_messages)
 
     kwargs["messages"] = [claude_identity] + non_system_messages
     return kwargs
@@ -972,6 +1014,29 @@ def _google_usage(meta):
         total_tokens=meta.get("totalTokenCount"),
     )
 
+# omp mapStopReason: MAX_TOKENS is truncation, and the filter reasons are
+# errors. Without this the finaliser always said "stop", and a cut by a token
+# limit or a safety block reached the client as a normal, short answer.
+_GOOGLE_FINISH_ERROR = (
+    "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY",
+    "RECITATION", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "NO_IMAGE",
+    "OTHER",
+)
+
+def _google_finish_reason(raw, has_tool_calls):
+    """Translates candidates[0].finishReason into the OpenAI shape."""
+    reason = str(raw or "").strip().upper()
+    if has_tool_calls and reason in ("", "STOP", "MAX_TOKENS", "FINISH_REASON_UNSPECIFIED"):
+        return "tool_calls"
+    if reason == "MAX_TOKENS":
+        return "length"
+    if reason in _GOOGLE_FINISH_ERROR:
+        # content_filter is the only OpenAI value that does not lie about a cut
+        # imposed by the server; the raw name travels in the in-band error when
+        # there is one.
+        return "content_filter"
+    return "stop"
+
 def _codex_usage(meta):
     """OMP `eRe`: unlike Google, input_tokens is not reduced by cached_tokens."""
     details = meta.get("input_tokens_details") or {}
@@ -1092,19 +1157,20 @@ def _strip_codex_output_limits(kwargs):
         for key in ("max_tokens", "max_output_tokens", "max_completion_tokens"):
             kwargs["extra_body"].pop(key, None)
 
-# A ChatGPT account (Plus/Pro) rejects the 5.4 family with
-# "The 'gpt-5.4' model is not supported when using Codex with a ChatGPT
-# account" - 5.5 is the equivalent the backend serves. This map is the single
-# source of truth for the wire id, so it also covers config aliases that
-# still point at 5.4.
+# A ChatGPT account rejects the 5.4 family with "The 'gpt-5.4' model is not
+# supported when using Codex with a ChatGPT account".
+# Family aliases, not version aliases: "codex"/"gpt-5"/"gpt-6" do not promise a
+# concrete version, so resolving them to the served one is honest. `gpt-5.4`
+# and `gpt-5.4-mini` were here pointing at gpt-5.5: they name a version this
+# account does not serve, and the client was billed and logged against a model
+# that never ran. They come out of here and out of the config entries; whoever
+# asks for them now gets the upstream refusal.
 _CODEX_WIRE_ALIASES = {
     "gpt-6": "gpt-6-astra",
     "gpt6": "gpt-6-astra",
     "gpt-5": "gpt-5.5",
     "gpt5": "gpt-5.5",
     "codex": "gpt-5.5",
-    "gpt-5.4": "gpt-5.5",
-    "gpt-5.4-mini": "gpt-5.5",
 }
 
 # With reasoning off, GPT-5.6+ Responses still reserve "juice"; omp pins it
@@ -1318,6 +1384,16 @@ async def _codex_open_async(client, url, body, headers_box, token):
         raise Exception(f"OpenAI Codex error {status}: {err_text}")
     raise Exception("OpenAI Codex error: tentativas de abertura esgotadas")
 
+# omp: completed -> stop, incomplete -> length, failed/cancelled -> error. The
+# two readers (sync and stream) had drifted into different shapes of this.
+def _codex_finish_reason(status, has_tool_calls):
+    normalized = str(status or "completed").strip().lower()
+    if has_tool_calls:
+        return "tool_calls"
+    if normalized == "incomplete":
+        return "length"
+    return "stop"
+
 def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
     url = "https://chatgpt.com/backend-api/codex/responses"
     body = _codex_request_body(model, messages, tools, extra_kwargs)
@@ -1329,6 +1405,7 @@ def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
     active_tools = {}
     usage_meta = {}
     terminal_seen = False
+    completion_status = None
 
     with httpx.Client(timeout=_CODEX_TIMEOUT) as client:
         resp = _codex_open(client, url, body, [headers], token)
@@ -1367,9 +1444,18 @@ def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
                         reasoning_text.append(event.get("delta", ""))
                     elif etype == "response.output_text.delta":
                         full_text.append(event.get("delta", ""))
+                    elif etype == "response.refusal.delta":
+                        # omp treats a refusal as visible text; without this
+                        # branch a refused turn returned empty content and a
+                        # clean stop.
+                        full_text.append(event.get("delta", ""))
                     elif etype in ("response.completed", "response.incomplete"):
                         terminal_seen = True
                         usage_meta = event.get("response", {}).get("usage") or {}
+                        completion_status = (
+                            event.get("response", {}).get("status")
+                            or ("incomplete" if etype == "response.incomplete" else "completed")
+                        )
                     elif etype in ["response.failed", "error"]:
                         err_obj = event.get("response", {}).get("error") or event.get("message") or "Unknown error"
                         raise Exception(f"OpenAI Codex stream failed: {err_obj}")
@@ -1385,7 +1471,10 @@ def _call_codex_sync(model, messages, token, tools=None, extra_kwargs=None):
     if not terminal_seen:
         raise Exception("OpenAI Codex stream ended without response.completed/response.incomplete")
 
-    return "".join(full_text), "".join(reasoning_text), tool_calls, _codex_usage(usage_meta)
+    return (
+        "".join(full_text), "".join(reasoning_text), tool_calls,
+        _codex_usage(usage_meta), completion_status,
+    )
 
 async def _stream_codex_generator(model, messages, token, tools=None, extra_kwargs=None):
     url = "https://chatgpt.com/backend-api/codex/responses"
@@ -1522,7 +1611,7 @@ async def _stream_codex_generator(model, messages, token, tools=None, extra_kwar
         await resp.aclose()
     if not terminal_seen:
         raise Exception("OpenAI Codex stream ended without response.completed/response.incomplete")
-    finish_reason = "tool_calls" if has_tool_calls else ("length" if completion_status == "incomplete" else "stop")
+    finish_reason = _codex_finish_reason(completion_status, has_tool_calls)
     yield ModelResponseStream(
         id=resp_id,
         created=created,
@@ -1645,9 +1734,21 @@ _GOOGLE_TIMEOUT = httpx.Timeout(None, connect=30.0, read=300.0, write=60.0)
 # visible text. Only a whole part that parses as an object carrying planning
 # markers is discarded, so a legitimate JSON answer from the user is never
 # swallowed.
+# omp consumePlanningBuffer: classifies as a leak an object carrying `thought`,
+# `call`, `_i`, `paths`, `command`, or the `path`+`content` pair. We used to
+# always require the `thought` key, so a leak shaped {"call":...,"_i":...} went
+# through whole to the client.
 _GOOGLE_LEAK_MARKERS = ("thought", "_i", "call", "paths", "command")
 
-def _google_is_planning_leak(text):
+# ...and the filter only applies to the family that actually spills planning
+# into the visible text (isFlashLeakModel). Applied to every model, a `pro`
+# legitimately answering {"command": "ls"} saw its answer erased.
+def _google_is_flash_leak_model(model):
+    return "flash" in str(model).split("/")[-1].lower()
+
+def _google_is_planning_leak(text, model=None):
+    if model is not None and not _google_is_flash_leak_model(model):
+        return False
     stripped = str(text).strip()
     if not stripped.startswith("{") or not stripped.endswith("}"):
         return False
@@ -1657,9 +1758,9 @@ def _google_is_planning_leak(text):
         return False
     if not isinstance(parsed, dict):
         return False
-    if "thought" in parsed and any(marker in parsed for marker in ("_i", "call", "paths", "command")):
+    if any(marker in parsed for marker in _GOOGLE_LEAK_MARKERS):
         return True
-    return "thought" in parsed and len(parsed) == 1
+    return "path" in parsed and "content" in parsed
 # The account's real catalogue via :fetchAvailableModels (body {"project": ...};
 # `metadata`/`cloudaicompanionProject` return 400 on this endpoint).
 _ANTIGRAVITY_MODEL_CACHE = {"at": 0.0, "ids": (), "info": {}}
@@ -1690,7 +1791,12 @@ _ANTIGRAVITY_EFFORT_OVERRIDES = {
     ("gemini-3.5-flash", "xhigh"): "gemini-3-flash-agent",
     ("gemini-3.5-flash", "max"): "gemini-3-flash-agent",
 }
-_ANTIGRAVITY_SUFFIXES = ("-thinking", "-tiered", "-extra-low", "-low", "-medium", "-high", "-agent")
+# Variant suffixes that are peeled off to reach the family. `-thinking` was
+# deliberately removed: `gemini-2.5-flash-thinking` exists in the catalogue and
+# matches by exact name, while `gemini-3.8-flash-thinking` does not exist --
+# peeling it made an invented name be served by `-low` in silence, which is
+# exactly what dropping those entries from the config was meant to avoid.
+_ANTIGRAVITY_SUFFIXES = ("-tiered", "-extra-low", "-low", "-medium", "-high", "-agent")
 
 def _antigravity_available_models(token, project_id):
     now = time.time()
@@ -1712,7 +1818,14 @@ def _antigravity_available_models(token, project_id):
             if resp.status_code == 200:
                 payload = json.loads(resp.read().decode("utf-8", "replace"))
                 models = payload.get("models") or {}
-                ids = tuple(models.keys())
+                # The catalogue lists variants that no longer answer and marks
+                # them in deprecatedModelIds -- that is how gemini-3.1-pro-high
+                # shows up as served and returns 400 INVALID_ARGUMENT.
+                # Subtracting the catalogue's own list beats our static one.
+                deprecated = {
+                    str(x).lower() for x in (payload.get("deprecatedModelIds") or [])
+                }
+                ids = tuple(k for k in models.keys() if str(k).lower() not in deprecated)
                 if ids:
                     cached["at"] = now
                     cached["ids"] = ids
@@ -1732,6 +1845,13 @@ def _map_antigravity_model(model_str, effort=None):
     raw = model_str.split("/")[-1].lower()
     available = _ANTIGRAVITY_MODEL_CACHE["ids"]
     if available:
+        # If the requested name *is* a served variant, it is respected: asking
+        # for `gemini-3.8-flash-tiered` (real in the catalogue, and what
+        # tieredModelIds points at for flash) cannot end up as `-low` just
+        # because the effort said so. The suffix used to be peeled off
+        # unconditionally and the client's request was lost.
+        if raw in available and raw not in _ANTIGRAVITY_BROKEN_WIRE:
+            return raw
         base = _antigravity_base_family(raw)
         eff = str(effort or "medium").strip().lower() or "medium"
         candidates = []
@@ -1744,12 +1864,14 @@ def _map_antigravity_model(model_str, effort=None):
                 continue
             if candidate in available:
                 return candidate
+    # Static fallback, used only when the catalogue did not answer. The
+    # `-thinking` entries are gone: they do not exist upstream. The `-tiered`
+    # ones do exist and point at themselves, because peeling an explicit
+    # request is a lie.
     mapping = {
-        "gemini-3.8-flash-thinking": "gemini-3.8-flash-low",
-        "gemini-3.8-flash-tiered": "gemini-3.8-flash-low",
+        "gemini-3.8-flash-tiered": "gemini-3.8-flash-tiered",
         "gemini-3.8-flash": "gemini-3.8-flash-low",
-        "gemini-3.7-flash-thinking": "gemini-3.7-flash-low",
-        "gemini-3.7-flash-tiered": "gemini-3.7-flash-low",
+        "gemini-3.7-flash-tiered": "gemini-3.7-flash-tiered",
         "gemini-3.7-flash": "gemini-3.7-flash-low",
         "gemini-3.6-flash": "gemini-3.6-flash-low",
         "gemini-3.5-flash": "gemini-3.5-flash-extra-low",
@@ -1761,8 +1883,17 @@ def _map_antigravity_model(model_str, effort=None):
         "gemini-2.5-flash-lite": "gemini-2.5-flash-lite",
         "gemini-2.5-flash": "gemini-2.5-flash",
     }
+    if raw in mapping:
+        return mapping[raw]
+    # Partial match only when what is left over is a variant suffix we know.
+    # With a raw `if k in raw`, `gemini-3.8-flash` matched inside
+    # `gemini-3.8-flash-thinking` and served `-low` for a name that does not
+    # exist.
     for k, v in mapping.items():
-        if k in raw:
+        if not raw.startswith(k):
+            continue
+        rest = raw[len(k):]
+        if not rest or rest in _ANTIGRAVITY_SUFFIXES:
             return v
     # With no match, no other model is served silently: the gemini-* wildcard
     # would make any invented name answer as gemini-2.5-flash, with the `model`
@@ -1947,8 +2078,16 @@ def _messages_to_antigravity_payload(model, messages, project_id, tools=None, ex
     }
 
 def _antigravity_open(client, payload, headers):
-    """Tries the endpoints in order (last good first), refreshing the token on
-    401 and downgrading the model on 404/503, like omp."""
+    """Tries the endpoints in order (last good first), refreshing the token on 401.
+
+    OMP's failover is on the *endpoint* only (daily -> sandbox,
+    `lastGoodEndpoint`). Here there was also a model degradation: on 404/503 the
+    request was resent with model="gemini-3.7-flash-low" and the response kept
+    echoing the requested name, so a client asking for gemini-3.1-pro could get
+    flash labelled as pro -- and the spend log billed it as pro. A 404 means
+    "this account does not serve this model" and a 503 is capacity; neither of
+    them authorises answering with a different model in silence.
+    """
     last = None
     for url in _antigravity_urls():
         resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
@@ -1959,23 +2098,23 @@ def _antigravity_open(client, payload, headers):
                 raise Exception("Google Antigravity error 401: token could not be refreshed")
             headers["Authorization"] = f"Bearer {fresh_token}"
             resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
-        if resp.status_code in (404, 503) and payload.get("model") != "gemini-3.7-flash-low":
-            resp.close()
-            payload["model"] = "gemini-3.7-flash-low"
-            resp = client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
         if resp.status_code == 200:
             _antigravity_mark_host(url)
             return resp
         last = (url, resp.status_code, resp.read().decode("utf-8", "replace"))
         resp.close()
     url, status, body = last
-    raise Exception(f"Google Antigravity error {status} ({url}): {body}")
+    raise Exception(
+        f"Google Antigravity error {status} ({url}) for model "
+        f"'{payload.get('model')}': {body}"
+    )
 
-def _antigravity_collect(resp):
+def _antigravity_collect(resp, wire_model=None):
     full_text = []
     reasoning_text = []
     tool_calls = []
     usage_meta = {}
+    finish_raw = None
     for line in resp.iter_lines():
         line_str = line.strip()
         if not line_str.startswith("data: "):
@@ -1991,12 +2130,13 @@ def _antigravity_collect(resp):
         resp_obj = event.get("response") or {}
         candidates = resp_obj.get("candidates") or []
         if candidates:
+            finish_raw = candidates[0].get("finishReason") or finish_raw
             for p in candidates[0].get("content", {}).get("parts", []) or []:
                 txt = p.get("text", "")
                 if txt:
                     if p.get("thought"):
                         reasoning_text.append(txt)
-                    elif not _google_is_planning_leak(txt):
+                    elif not _google_is_planning_leak(txt, wire_model):
                         full_text.append(txt)
                 fc = p.get("functionCall")
                 if fc:
@@ -2012,7 +2152,9 @@ def _antigravity_collect(resp):
         usage = resp_obj.get("usageMetadata") or {}
         if usage:
             usage_meta = usage
-    return "".join(full_text), "".join(reasoning_text), tool_calls, usage_meta
+    return (
+        "".join(full_text), "".join(reasoning_text), tool_calls, usage_meta, finish_raw,
+    )
 
 def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra_kwargs=None):
     _antigravity_available_models(token, project_id)
@@ -2028,22 +2170,31 @@ def _call_antigravity_sync(model, messages, token, project_id, tools=None, extra
     content = reasoning = ""
     tool_calls = []
     usage_meta = {}
+    finish_raw = None
     with httpx.Client(timeout=_GOOGLE_TIMEOUT) as client:
         # Gemini occasionally closes with finishReason STOP and zero parts; omp asks
-        # again instead of returning an empty turn.
+        # again instead of returning an empty turn. An empty turn caused by
+        # MAX_TOKENS or by a filter is not retried: it is deterministic.
         for attempt in range(_GOOGLE_MAX_EMPTY_RETRIES + 1):
             resp = _antigravity_open(client, payload, headers)
             try:
-                content, reasoning, tool_calls, usage_meta = _antigravity_collect(resp)
+                content, reasoning, tool_calls, usage_meta, finish_raw = _antigravity_collect(
+                    resp, payload.get("model")
+                )
             finally:
                 resp.close()
             if content or reasoning or tool_calls or attempt >= _GOOGLE_MAX_EMPTY_RETRIES:
+                break
+            if str(finish_raw or "STOP").upper() not in ("STOP", "FINISH_REASON_UNSPECIFIED"):
                 break
             time.sleep(delay)
             delay *= 2
             payload["requestId"] = _antigravity_request_id()
 
-    return content, reasoning, tool_calls, _google_usage(usage_meta)
+    return (
+        content, reasoning, tool_calls, _google_usage(usage_meta),
+        _google_finish_reason(finish_raw, bool(tool_calls)),
+    )
 
 async def _antigravity_open_async(client, payload, headers):
     last = None
@@ -2056,17 +2207,17 @@ async def _antigravity_open_async(client, payload, headers):
                 raise Exception("Google Antigravity error 401: token could not be refreshed")
             headers["Authorization"] = f"Bearer {fresh_token}"
             resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
-        if resp.status_code in (404, 503) and payload.get("model") != "gemini-3.7-flash-low":
-            await resp.aclose()
-            payload["model"] = "gemini-3.7-flash-low"
-            resp = await client.send(client.build_request("POST", url, json=payload, headers=headers), stream=True)
         if resp.status_code == 200:
             _antigravity_mark_host(url)
             return resp
         last = (url, resp.status_code, (await resp.aread()).decode("utf-8", "replace"))
         await resp.aclose()
     url, status, body = last
-    raise Exception(f"Google Antigravity error {status} ({url}): {body}")
+    # No model degradation: see the note in _antigravity_open.
+    raise Exception(
+        f"Google Antigravity error {status} ({url}) for model "
+        f"'{payload.get('model')}': {body}"
+    )
 
 async def _stream_antigravity_once(model, messages, token, project_id, tools=None, extra_kwargs=None, payload=None):
     payload = payload if payload is not None else _messages_to_antigravity_payload(
@@ -2084,6 +2235,7 @@ async def _stream_antigravity_once(model, messages, token, project_id, tools=Non
     current_tool_index = 0
     has_tool_calls = False
     usage_meta = {}
+    finish_raw = None
 
     async with httpx.AsyncClient(timeout=_GOOGLE_TIMEOUT) as client:
         resp = await _antigravity_open_async(client, payload, headers)
@@ -2106,12 +2258,15 @@ async def _stream_antigravity_once(model, messages, token, project_id, tools=Non
                     usage_meta = resp_obj.get("usageMetadata") or usage_meta
                     candidates = resp_obj.get("candidates", [])
                     if candidates:
+                        finish_raw = candidates[0].get("finishReason") or finish_raw
                         parts = candidates[0].get("content", {}).get("parts", [])
                         for p in parts:
                             txt = p.get("text", "")
                             if txt:
                                 is_thought = bool(p.get("thought", False))
-                                if not is_thought and _google_is_planning_leak(txt):
+                                if not is_thought and _google_is_planning_leak(
+                                    txt, payload.get("model")
+                                ):
                                     continue
                                 delta_obj = Delta(reasoning_content=txt) if is_thought else Delta(content=txt)
                                 yield ModelResponseStream(
@@ -2173,7 +2328,7 @@ async def _stream_antigravity_once(model, messages, token, project_id, tools=Non
                     pass
         await resp.aclose()
 
-    finish_reason = "tool_calls" if has_tool_calls else "stop"
+    finish_reason = _google_finish_reason(finish_raw, has_tool_calls)
     yield ModelResponseStream(
         id=resp_id,
         created=created,
@@ -2195,16 +2350,30 @@ def _stream_chunk_is_meaningful(chunk):
         or getattr(delta, "tool_calls", None)
     )
 
+def _stream_chunk_finish_reason(chunk):
+    try:
+        return chunk.choices[0].finish_reason
+    except Exception:
+        return None
+
 async def _stream_antigravity_generator(model, messages, token, project_id, tools=None, extra_kwargs=None):
     """Retries while the stream closes with no content. Leading non-meaningful
     chunks are held back until a meaningful one arrives, so the finish/usage of an
-    empty attempt never reaches the client."""
+    empty attempt never reaches the client.
+
+    OMP only retries when the attempt closed on `stop` (hasVisibleAssistant-
+    Content + stopReason). A turn that comes out empty because of MAX_TOKENS or
+    a content filter is deterministic: retrying that meant paying for the prompt
+    4 times to get the same emptiness, and it hid the real reason from the
+    client.
+    """
     _antigravity_available_models(token, project_id)
     payload = _messages_to_antigravity_payload(model, messages, project_id, tools=tools, extra_kwargs=extra_kwargs)
     delay = _GOOGLE_EMPTY_RETRY_BASE_S
     for attempt in range(_GOOGLE_MAX_EMPTY_RETRIES + 1):
         pending = []
         meaningful = False
+        retryable = False
         async for chunk in _stream_antigravity_once(
             model, messages, token, project_id, tools=tools, extra_kwargs=extra_kwargs, payload=payload
         ):
@@ -2217,8 +2386,10 @@ async def _stream_antigravity_generator(model, messages, token, project_id, tool
                 pending = []
                 yield chunk
             else:
+                if _stream_chunk_finish_reason(chunk) == "stop":
+                    retryable = True
                 pending.append(chunk)
-        if meaningful or attempt >= _GOOGLE_MAX_EMPTY_RETRIES:
+        if meaningful or not retryable or attempt >= _GOOGLE_MAX_EMPTY_RETRIES:
             for held in pending:
                 yield held
             return
@@ -2255,9 +2426,10 @@ try:
                 ), model, logging_obj)
             else:
                 loop = asyncio.get_event_loop()
-                content, reasoning, tool_calls, usage = await loop.run_in_executor(None, _call_antigravity_sync, model, messages, google_token, google_project, tools, kwargs)
+                content, reasoning, tool_calls, usage, finish_reason = await loop.run_in_executor(
+                    None, _call_antigravity_sync, model, messages, google_token, google_project, tools, kwargs
+                )
                 msg = _bridge_message(content, reasoning, tool_calls)
-                finish_reason = "tool_calls" if tool_calls else "stop"
                 response = ModelResponse(
                     id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
                     object="chat.completion",
@@ -2283,9 +2455,11 @@ try:
                 ), model, logging_obj)
             else:
                 loop = asyncio.get_event_loop()
-                content, reasoning, tool_calls, usage = await loop.run_in_executor(None, _call_codex_sync, model, messages, codex_token, tools, kwargs)
+                content, reasoning, tool_calls, usage, status = await loop.run_in_executor(
+                    None, _call_codex_sync, model, messages, codex_token, tools, kwargs
+                )
                 msg = _bridge_message(content, reasoning, tool_calls)
-                finish_reason = "tool_calls" if tool_calls else "stop"
+                finish_reason = _codex_finish_reason(status, bool(tool_calls))
                 response = ModelResponse(
                     id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
                     object="chat.completion",
@@ -2317,9 +2491,10 @@ try:
             google_project = _token_manager.get_google_project_id()
             if google_token:
                 tools = kwargs.get("tools")
-                content, reasoning, tool_calls, usage = _call_antigravity_sync(model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs)
+                content, reasoning, tool_calls, usage, finish_reason = _call_antigravity_sync(
+                    model, messages, google_token, google_project, tools=tools, extra_kwargs=kwargs
+                )
                 msg = _bridge_message(content, reasoning, tool_calls)
-                finish_reason = "tool_calls" if tool_calls else "stop"
                 return ModelResponse(
                     id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
                     object="chat.completion",
@@ -2336,9 +2511,13 @@ try:
             if not codex_token:
                 raise Exception("OpenAI Codex OAuth token unavailable or expired")
             tools = kwargs.get("tools")
-            content, reasoning, tool_calls, usage = _call_codex_sync(model, messages, codex_token, tools=tools, extra_kwargs=kwargs)
+            content, reasoning, tool_calls, usage, status = _call_codex_sync(
+                model, messages, codex_token, tools=tools, extra_kwargs=kwargs
+            )
             msg = _bridge_message(content, reasoning, tool_calls)
-            finish_reason = "tool_calls" if tool_calls else "stop"
+            # `response.incomplete` is truncation against the output limit;
+            # without this a cut-off response reached the client as a clean stop.
+            finish_reason = _codex_finish_reason(status, bool(tool_calls))
             return _attach_codex_quota(ModelResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
                 object="chat.completion",
@@ -2365,11 +2544,11 @@ try:
                     _stream_antigravity_generator(model, messages, token, project, tools=kwargs.get("tools"), extra_kwargs=kwargs),
                     logging_obj, messages, start_time,
                 ), model, logging_obj)
-            content, reasoning, tool_calls, usage = await asyncio.get_event_loop().run_in_executor(
+            content, reasoning, tool_calls, usage, finish_reason = await asyncio.get_event_loop().run_in_executor(
                 None, _call_antigravity_sync, model, messages, token, project, kwargs.get("tools"), kwargs
             )
             message = _bridge_message(content, reasoning, tool_calls)
-            response = ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage=usage)
+            response = ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": finish_reason}], usage=usage)
             await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
             return response
         if _is_codex_model(model):
@@ -2382,11 +2561,11 @@ try:
                     _stream_codex_generator(model, messages, token, tools=kwargs.get("tools"), extra_kwargs=kwargs),
                     logging_obj, messages, start_time,
                 ), model, logging_obj)
-            content, reasoning, tool_calls, usage = await asyncio.get_event_loop().run_in_executor(
+            content, reasoning, tool_calls, usage, status = await asyncio.get_event_loop().run_in_executor(
                 None, _call_codex_sync, model, messages, token, kwargs.get("tools"), kwargs
             )
             message = _bridge_message(content, reasoning, tool_calls)
-            response = _attach_codex_quota(ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}], usage=usage))
+            response = _attach_codex_quota(ModelResponse(id=f"chatcmpl-{uuid.uuid4().hex[:12]}", object="chat.completion", created=int(time.time()), model=model, choices=[{"index": 0, "message": message, "finish_reason": _codex_finish_reason(status, bool(tool_calls))}], usage=usage))
             await _emit_bridge_success(logging_obj, response, start_time, datetime.datetime.now())
             return response
         return await _orig_router_acompletion(self, model=model, messages=messages, stream=stream, **kwargs)

@@ -143,8 +143,8 @@ Open `http://localhost:3737` to access the Quota Dashboard.
 | Provider | Subscriptions | Model IDs in LiteLLM | Tool Calling | Streaming |
 |---|---|---|---|---|
 | **Anthropic** | Claude Max / Pro | `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5` | ✔️ Full | ✔️ Full |
-| **Google** | Google One AI / Antigravity | `gemini-3.7-flash`, `gemini-2.5-pro`, `gemini-2.5-flash` | ✔️ Full | ✔️ Full |
-| **OpenAI** | ChatGPT Plus / Pro | `gpt-5.6-terra`, `gpt-5.6-sol`, `gpt-5.4`, `gpt-5.4-mini` | ✔️ Full | ✔️ Full |
+| **Google** | Google One AI / Antigravity | `gemini-3.8-flash`, `gemini-3.1-pro`, `gemini-2.5-pro` | ✔️ Full | ✔️ Full |
+| **OpenAI** | ChatGPT Plus / Pro | `gpt-5.6-terra`, `gpt-5.6-sol`, `gpt-5.6-luna`, `gpt-6-astra` | ✔️ Full | ✔️ Full |
 | **Local vLLM** | Self-Hosted | `qwen-agent-coder` (Qwen 3.5 27B NVFP4) | ✔️ Full | ✔️ Full |
 
 ---

@@ -28,6 +28,7 @@ names = {
     "_google_text_parts",
     "_google_tool_choice",
     "_google_is_planning_leak",
+    "_google_is_flash_leak_model",
     "_tools_to_antigravity_tools",
     "_tool_result_value",
     "_messages_to_antigravity_payload",
@@ -196,9 +197,14 @@ print("Codex prompt cache key stability OK")
 # Remapping an arbitrary name to the fallback model answered 200 while the
 # `model` field echoed the requested name: billing and comparisons lied. Only
 # deliberate aliases may be remapped.
-for alias in ("gpt-5.4", "codex", "gpt-6"):
+for alias in ("codex", "gpt-6"):
     assert namespace["_codex_remember_unsupported"]({"model": alias}) is True, alias
-for arbitrary in ("gpt-4.1", "o3-mini", "gpt-3.5-turbo"):
+# A family alias ("codex", "gpt-5", "gpt-6") promises no concrete version, so
+# resolving it to the served one is honest. `gpt-5.4`/`gpt-5.4-mini` name a
+# version this account does not serve: remapping them to gpt-5.5 billed and
+# logged the client against a model that never ran, so they are no longer
+# aliases and the upstream refusal propagates.
+for arbitrary in ("gpt-5.4", "gpt-5.4-mini", "gpt-4.1", "o3-mini", "gpt-3.5-turbo"):
     assert namespace["_codex_remember_unsupported"]({"model": arbitrary}) is False, arbitrary
 print("Codex honest model fallback OK")
 
@@ -232,7 +238,16 @@ assert leak('{"thought":"planning","_i":3}')
 assert leak('{"thought":"only"}')
 assert not leak('{"result": 42, "ok": true}')
 assert not leak("plain text")
-assert not leak('{"call":"f"}')
+# omp consumePlanningBuffer classifies as a leak any object carrying `thought`,
+# `call`, `_i`, `paths`, `command`, or the `path`+`content` pair. Requiring
+# `thought` let a leak shaped {"call":...,"_i":...} through whole to the client.
+assert leak('{"call":"f"}')
+assert leak('{"path":"a.py","content":"x"}')
+# Only the flash family spills planning into the visible text
+# (isFlashLeakModel); applied to every model, a `pro` legitimately answering
+# {"command": "ls"} saw its answer erased.
+assert leak('{"command":"ls"}', "gemini-3.8-flash-low")
+assert not leak('{"command":"ls"}', "gemini-3.1-pro-low")
 print("Antigravity planning leak filter OK")
 
 # The Responses route sends reasoning as an object.

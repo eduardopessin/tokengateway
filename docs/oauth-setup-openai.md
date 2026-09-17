@@ -23,7 +23,13 @@ Once authenticated, LiteLLM routes the following model IDs to ChatGPT Plus with 
 - `gpt-5.6-terra`
 - `gpt-5.6-sol`
 - `gpt-5.6-luna`
-- `gpt-5.4`
-- `gpt-5.4-mini`
+- `gpt-6-astra`
 - `gpt-5`
 - `codex`
+
+`gpt-5`, `gpt-6` and `codex` are family aliases: they do not name a version, so
+resolving them to the served one is honest. Version-specific names are not
+aliased. The `gpt-5.4` family is refused by a ChatGPT account — *"The 'gpt-5.4'
+model is not supported when using Codex with a ChatGPT account"* — so those
+names are not served at all rather than quietly answered by `gpt-5.5`, which
+would bill and log the client against a model that never ran.

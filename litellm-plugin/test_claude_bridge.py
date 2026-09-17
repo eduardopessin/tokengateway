@@ -25,7 +25,7 @@ constants = [
     if isinstance(node, ast.Assign)
     and any(
         getattr(t, "id", "").startswith(
-            ("ANTHROPIC_CACHE", "_ANTHROPIC_UNCACHEABLE", "_ANTHROPIC_EFFORT", "_ANTHROPIC_ADAPTIVE")
+            ("ANTHROPIC_CACHE", "_ANTHROPIC_")
         )
         for t in node.targets
     )
@@ -49,16 +49,26 @@ request = {
     ],
 }
 result = inject(copy.deepcopy(request))
+# Measured upstream with the OAuth token (claude-opus-5/sonnet-4-6/opus-4-8/
+# opus-4-6, max_tokens=64): system=[identity] -> 200, system=[identity, client]
+# -> 200 and the client instruction is obeyed (ZX9-ACK marker on all four
+# models), system=[client] -> 429 rate_limit_error. The OAuth rejection depends
+# on the identity being the first block, not on there being only one block, so
+# the client prompt keeps system authority instead of being spliced into the
+# first user turn.
 assert result["messages"][0] == {
     "role": "system",
-    "content": [{"type": "text", "text": namespace["CLAUDE_CODE_PROMPT"]}],
+    "content": [
+        {"type": "text", "text": namespace["CLAUDE_CODE_PROMPT"]},
+        {"type": "text", "text": "Stable client instruction."},
+    ],
 }
 first_user = result["messages"][1]
 assert first_user["role"] == "user"
 # Reference (wSe) puts no marker on system, and (Mzr) anchors the last two
 # markable turns. In the OpenAI shape those are the assistant turn and the tool
-# result, so the earlier user turn -- instructions included -- stays unmarked
-# and is covered by prefix semantics.
+# result, so the earlier user turn stays unmarked and is covered by prefix
+# semantics.
 assert not any("cache_control" in block for block in first_user["content"])
 assert result["messages"][2]["content"] == [
     {"type": "text", "text": "Pong", "cache_control": {"type": "ephemeral"}}
@@ -94,19 +104,23 @@ adaptive_request = inject({
 })
 assert adaptive_request["thinking"] == {"type": "adaptive", "display": "summarized"}
 assert adaptive_request["output_config"] == {"effort": "high"}
-assert adaptive_request["max_tokens"] == 16384
+# Measured: max_tokens=64000 is accepted on this subscription (200), so the
+# 16384 ceiling that used to be applied here truncated responses the client had
+# asked for. Only the floor (budget + 2048) remains.
+assert adaptive_request["max_tokens"] == 128000
 assert "reasoning_effort" not in adaptive_request
 print("Claude adaptive thinking OK")
 
-# Models up to 4.6 keep the budget shape.
+# The models that reject adaptive keep the budget shape: measured, adaptive on
+# claude-sonnet-4-5 answers 400 while budget returns 367 chars of reasoning.
 thinking_request = inject({
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-4-5",
     "reasoning_effort": "high",
     "max_tokens": 128000,
     "messages": [{"role": "user", "content": "Think."}],
 })
 assert thinking_request["thinking"] == {"type": "enabled", "budget_tokens": 8192}
-assert thinking_request["max_tokens"] == 16384
+assert thinking_request["max_tokens"] == 128000
 assert "output_config" not in thinking_request
 assert "reasoning_effort" not in thinking_request
 print("Claude budget thinking limits OK")
@@ -135,8 +149,9 @@ assert object_effort["thinking"] == {"type": "adaptive", "display": "summarized"
 print("Claude object-shaped reasoning_effort OK")
 
 # OMP's captured wire payload uses max_completion_tokens (OpenAI-style), not
-# max_tokens; the clamp must fold it into max_tokens or the raw high value
-# still reaches Anthropic and reproduces the 2026-08-27 429 regression.
+# max_tokens; only the key the client actually sent is touched, and it is then
+# folded into max_tokens. Filling both made the fold overwrite the client's
+# value with the default.
 omp_shaped_request = inject({
     "model": "claude-opus-5",
     "reasoning_effort": "high",
@@ -146,7 +161,9 @@ omp_shaped_request = inject({
     "messages": [{"role": "user", "content": "Think."}],
 })
 assert omp_shaped_request["thinking"] == {"type": "adaptive", "display": "summarized"}
-assert omp_shaped_request["max_tokens"] == 16384
+# Measured: max_tokens=64000 is accepted on this subscription (200), so the
+# client's value survives instead of being cut to 16384.
+assert omp_shaped_request["max_tokens"] == 64000
 assert "max_completion_tokens" not in omp_shaped_request
 assert "reasoning_effort" not in omp_shaped_request
 print("Claude OMP-shaped max_completion_tokens parity OK")
