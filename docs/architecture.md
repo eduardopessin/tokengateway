@@ -166,20 +166,56 @@ decides how much of the request is a cache hit. The placement here is ported 1:1
   base to write against 1.25x for 5 min, so the long TTL is opt-in rather than automatic.
 
 Because the bridge receives the OpenAI shape, a tool result arrives as its own
-`role: "tool"` message and an assistant tool call carries `content: None`. Rewriting either
-into a text block breaks the conversion LiteLLM performs downstream, so neither is ever a
-candidate for a marker.
+`role: "tool"` message and an assistant tool call carries `content: None`. Both are still
+valid anchors, but LiteLLM reads the marker from a different level for each
+(`litellm_core_utils/prompt_templates/factory.py`, v1.90.2):
 
-Measured on a repeated 11,543-token conversation: a single marker on the static prefix left
-`cache_read` pinned at 3,853 tokens regardless of conversation size — the cached share
-*decayed* as the session grew. Anchoring the tail moved it to 11,541 (99.98%).
+| Anchor | Where the marker goes | LiteLLM read site |
+|---|---|---|
+| Text block in a `user`/`assistant` turn | On the block | `anthropic_messages_pt` |
+| `role: "tool"` message | On the **message** | `convert_to_anthropic_tool_result:1844` |
+| `tool_calls[i]` of an assistant turn | Inside the **call** | `convert_to_anthropic_tool_invoke:2003` |
+
+A hosted-tool call (`srvtoolu_` id) is never an anchor, because LiteLLM emits
+`server_tool_use` with no `cache_control` (`factory.py:1971`). Nor is a call without
+`type: "function"`, which `convert_to_anthropic_tool_invoke:1952` drops outright.
+
+Getting this wrong is expensive and silent. Two measurements on the live gateway:
+
+- Marking only the static prefix left `cache_read` pinned at 3,853 tokens of an 11,543-token
+  conversation: the cached share *decayed* as the session grew. Anchoring the tail moved it
+  to 11,541 (99.98%).
+- Treating tool turns as unmarkable then reintroduced the same decay wherever a turn ended
+  in a tool result — the normal shape of an agent loop. The window stalled on the oldest
+  user turn: `claude-opus-5` read 2,876 of 8,697 prompt tokens, so **67% was re-read at full
+  price every turn** (`claude-sonnet-4-6`: 62%). Accepting both tool levels as anchors took
+  it to 8,695 of 8,697, and the uncached remainder stays at 1 token as the conversation
+  grows (3,326 → 4,434 → 5,542 tokens measured turn by turn).
+
+#### Upstream caching (Codex, Antigravity)
+
+Neither backend takes breakpoints; both cache prefixes on their own terms, so the only
+lever the gateway has is not disturbing the prefix. Measured against the backends directly,
+bypassing the gateway:
+
+- **Codex** caches by prefix above roughly 1k tokens. A 1,515-token prefix repeated five
+  times never cached (`cached_tokens: 0`), while a 13,515-token one hit 13,056. The
+  `prompt_cache_key` field is accepted but not echoed: `response.created` always reports a
+  fresh server-side UUID, so treat the key as a hint and never as a guarantee.
+- **Antigravity** caches only when the system prompt travels in native `systemInstruction`.
+  The same 10,807-token request cached 8,164 tokens that way and **nothing at all** (3/3
+  attempts, field absent) when the identical text was spliced into the first user turn —
+  which is the older shape this bridge used to send.
+- Caching is per wire deployment, not per logical model: `gemini-3.1-pro-low` never cached
+  across 3 attempts, while `gemini-pro-agent` (where high effort routes) cached 8,172 every
+  time. An effort change therefore also changes cache namespace.
 
 #### Usage Accounting
 
 The bridges answer requests themselves, so anything they fail to extract is lost: LiteLLM
-falls back to `token_counter` estimates (`prompt_tokens or token_counter(...)`) and every
-cache hit stays invisible in `/spend/logs`. The arithmetic differs per provider, and the
-asymmetry is intentional — it mirrors the reference implementation:
+falls back to `token_counter` estimates (`prompt_tokens or token_counter(...)`). The
+arithmetic differs per provider, and the asymmetry is intentional — it mirrors the
+reference implementation:
 
 | Provider | `input` | `output` | `cacheRead` |
 |---|---|---|---|
@@ -190,12 +226,36 @@ Both streaming generators emit a final chunk carrying `usage` so `stream_chunk_b
 upstream truth instead of estimating. Without it, streaming responses — which is what coding
 agents send — are logged as guesses.
 
+Do not look for cache tokens in the per-request log: `LiteLLM_SpendLogs` has no such
+column in v1.90.2, and the `cache_hit` / `cache_key` fields it does expose describe
+LiteLLM's own response cache, not the provider's. `cache_read_input_tokens` and
+`cache_creation_input_tokens` live on the daily rollups (`LiteLLM_DailyUserSpend` and
+siblings), readable through `/user/daily/activity`. Cost is the other honest signal: the
+same 2,214-token prompt logged $0.000747 on a cache hit against $0.008375 on a miss.
+
 #### Reloading the plugin on Kubernetes
 
 Mounting `sitecustomize.py` from a ConfigMap does **not** make a running process re-read it:
-the module stays imported in memory. Unless you run something like Stakater Reloader, the
-pod template itself has to change, so put a real hash of the ConfigMaps in the Deployment
-annotation and recompute it on every edit:
+the module stays imported in memory. Nor is there a reload route to call — the proxy exposes
+none among its 520 paths, and `POST /model/new` (with `store_model_in_db`) answers 200 while
+the model never appears in `/v1/models`. Only a new pod picks up a config change.
+
+The reliable trigger is Stakater Reloader, scoped to the ConfigMaps by name:
+
+```yaml
+annotations:
+  configmap.reloader.stakater.com/reload: "litellm-config,litellm-plugin"
+```
+
+Avoid `reloader.stakater.com/auto: "true"`. It also watches the Secret, and since OAuth
+access tokens rotate roughly hourly, the gateway restarts on every rotation — observed in
+the Reloader log as `Changes detected in 'litellm-secrets' of type 'SECRET'`, costing about
+100s of `503` per restart under `strategy: Recreate`, for a Secret the plugin already
+re-reads every 10 seconds. With the scoped annotation, a ConfigMap edit moved the
+Deployment from revision 243 to 244 while the next token rotation left it untouched.
+
+Without Reloader, the pod template itself has to change, so put a real hash of the
+ConfigMaps in the annotation and recompute it on every edit:
 
 ```yaml
 annotations:

@@ -372,21 +372,35 @@ def _anthropic_cache_control():
 # Azr: blocks that carry reasoning are never valid anchors.
 _ANTHROPIC_UNCACHEABLE_BLOCKS = ("thinking", "redacted_thinking", "fallback")
 
-def _anthropic_markable_message(message):
-    """Whether a breakpoint can be attached without corrupting structured payloads.
+# Hosted tools: LiteLLM emits `server_tool_use` with no cache_control
+# (factory.py:1971), so such a call cannot serve as an anchor.
+_ANTHROPIC_SERVER_TOOL_PREFIX = "srvtoolu_"
 
-    Deviation from the reference, forced by the wire shape: OMP marks Anthropic
-    messages, where tool results are `tool_result` blocks inside a user turn. We
-    see the OpenAI shape, where a tool result is its own `role: "tool"` message
-    and an assistant tool call carries `content: None`. Rewriting either into a
-    text block breaks the conversion LiteLLM performs downstream.
+def _anthropic_markable_message(message):
+    """Whether a breakpoint can be attached to this message.
+
+    OMP marks the Anthropic wire, where a tool result is a `tool_result` block
+    inside a `user` turn, so its rolling window always lands on the last two
+    turns. We see the OpenAI shape: a tool result is its own `role: "tool"`
+    message and an assistant tool call carries `content: None`. LiteLLM 1.90.2
+    forwards a breakpoint for both, but reads it from a different level
+    (`litellm_core_utils/prompt_templates/factory.py`):
+      - `role: "tool"`  -> message level, `convert_to_anthropic_tool_result:1844`
+      - `tool_calls[i]` -> inside the call, `convert_to_anthropic_tool_invoke:2003`
+      - text blocks     -> on the block itself
+    Refusing the first two pinned the window to the head of the conversation:
+    on a turn ending in a tool result, 67% of the prompt was re-read at full
+    price (measured: opus-5 pt=8697, read=2876).
     """
     if not isinstance(message, dict):
         return False
-    if message.get("role") not in ("user", "assistant", "developer"):
+    role = message.get("role")
+    if role == "tool" or message.get("tool_call_id"):
+        return True
+    if role not in ("user", "assistant", "developer"):
         return False
-    if message.get("tool_calls") or message.get("tool_call_id"):
-        return False
+    if _anthropic_tool_call_anchor(message) is not None:
+        return True
     content = message.get("content")
     if isinstance(content, str):
         return bool(content.strip())
@@ -399,10 +413,36 @@ def _anthropic_markable_message(message):
         )
     return False
 
+def _anthropic_tool_call_anchor(message):
+    """Index of the last tool call LiteLLM agrees to mark.
+
+    `convert_to_anthropic_tool_invoke:1952` skips anything not `type: "function"`.
+    """
+    calls = message.get("tool_calls")
+    if not isinstance(calls, list):
+        return None
+    for index in range(len(calls) - 1, -1, -1):
+        call = calls[index]
+        if not isinstance(call, dict):
+            continue
+        if call.get("type") != "function":
+            continue
+        if str(call.get("id") or "").startswith(_ANTHROPIC_SERVER_TOOL_PREFIX):
+            continue
+        return index
+    return None
+
 def _count_cache_breakpoints(messages):
     total = 0
     for message in messages:
-        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(message, dict):
+            continue
+        if message.get("cache_control"):
+            total += 1
+        for call in message.get("tool_calls") or ():
+            if isinstance(call, dict) and call.get("cache_control"):
+                total += 1
+        content = message.get("content")
         if isinstance(content, list):
             total += sum(
                 1 for block in content
@@ -411,8 +451,22 @@ def _count_cache_breakpoints(messages):
     return total
 
 def _mark_cache_breakpoint(message):
-    """Azr: mark the last non-reasoning block; bail when one is already marked."""
+    """Azr: mark the last non-reasoning anchor; bail when one is already marked."""
     control = _anthropic_cache_control()
+    if message.get("role") == "tool" or message.get("tool_call_id"):
+        if message.get("cache_control") is not None:
+            return False
+        message["cache_control"] = control
+        return True
+    # An assistant turn can carry both text and tool calls; on the Anthropic
+    # wire the `tool_use` follows the text, so it is the anchor covering more.
+    call_index = _anthropic_tool_call_anchor(message)
+    if call_index is not None:
+        call = message["tool_calls"][call_index]
+        if call.get("cache_control") is not None:
+            return False
+        call["cache_control"] = control
+        return True
     content = message.get("content")
     if isinstance(content, str):
         message["content"] = [{"type": "text", "text": content, "cache_control": control}]
@@ -453,6 +507,11 @@ def _apply_conversation_cache(messages):
             message["content"] = [
                 dict(block) if isinstance(block, dict) else block
                 for block in message["content"]
+            ]
+        if isinstance(message.get("tool_calls"), list):
+            message["tool_calls"] = [
+                dict(call) if isinstance(call, dict) else call
+                for call in message["tool_calls"]
             ]
         if _mark_cache_breakpoint(message):
             messages[index] = message
@@ -607,10 +666,9 @@ def _inject_claude_prompt(kwargs, args=None):
             instructions_index = first_user_index
 
     if not _apply_conversation_cache(non_system_messages) and instructions_index is not None:
-        # Deviation from the reference: in the OpenAI shape a turn can end with
-        # tool results only, leaving nothing markable. OMP never hits this because
-        # Anthropic messages always end on a user/assistant turn. Fall back to the
-        # instructions block so the static prefix still gets cached.
+        # Safety net: this is only left for a conversation with no markable
+        # message at all. Now that `role: "tool"` and `tool_calls` are anchors,
+        # a real conversation always takes the normal path above.
         fallback = dict(non_system_messages[instructions_index])
         fallback["content"] = [
             dict(block) if isinstance(block, dict) else block

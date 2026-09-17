@@ -3,11 +3,17 @@
 #
 # Two traps this manifest exists to document:
 #
-# 1. `checksum/config` must be recomputed by hand whenever either ConfigMap
-#    changes. A ConfigMap volume update rewrites the file on disk, but
-#    sitecustomize.py has already been imported into the running interpreter,
-#    so the pod keeps serving the old plugin until it is replaced. Without a
-#    Reloader in the cluster, a static annotation never triggers a rollover:
+# 1. A ConfigMap change needs a pod rollover. The volume update rewrites the
+#    file on disk, but sitecustomize.py has already been imported into the
+#    running interpreter, so the pod keeps serving the old plugin. There is no
+#    reload route either: the proxy exposes none of its 520 paths for it, and
+#    `POST /model/new` returns 200 without the model ever reaching /v1/models.
+#    The Deployment below delegates the rollover to Stakater Reloader, scoped to
+#    the ConfigMaps by name. Do not use `reloader.stakater.com/auto: "true"`:
+#    that also watches the Secret, and rotating OAuth tokens then restart the
+#    gateway roughly hourly (measured: ~100s of 503 per restart under
+#    `strategy: Recreate`) for a Secret the plugin already re-reads every 10s.
+#    Without Reloader installed, fall back to an annotation recomputed by hand:
 #
 #      sha256sum <(cat litellm-config.yaml sitecustomize.py) | cut -c1-16
 #
@@ -49,9 +55,9 @@ spec:
       labels:
         app: litellm
       annotations:
-        # sha256(config.yaml + sitecustomize.py)[:16] - recompute on every
-        # change to either ConfigMap. See trap 1 above.
-        checksum/config: "0000000000000000"
+        # Reloader restarts the pod when either ConfigMap changes. Scoped by
+        # name on purpose - see trap 1 above.
+        configmap.reloader.stakater.com/reload: "litellm-config,litellm-plugin"
     spec:
       serviceAccountName: litellm
       containers:

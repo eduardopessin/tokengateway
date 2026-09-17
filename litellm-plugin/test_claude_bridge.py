@@ -7,6 +7,7 @@ module = ast.parse(source)
 wanted = {
     "_inject_claude_prompt",
     "_anthropic_markable_message",
+    "_anthropic_tool_call_anchor",
     "_anthropic_cache_control",
     "_count_cache_breakpoints",
     "_mark_cache_breakpoint",
@@ -55,17 +56,18 @@ assert result["messages"][0] == {
 first_user = result["messages"][1]
 assert first_user["role"] == "user"
 # Reference (wSe) puts no marker on system, and (Mzr) anchors the last two
-# markable turns: here the first user turn and the assistant turn. The
-# instructions block itself stays unmarked; the marker lands on the last block.
-assert "cache_control" not in first_user["content"][0]
-assert first_user["content"][1] == {
-    "type": "text", "text": "Ping", "cache_control": {"type": "ephemeral"},
-}
+# markable turns. In the OpenAI shape those are the assistant turn and the tool
+# result, so the earlier user turn -- instructions included -- stays unmarked
+# and is covered by prefix semantics.
+assert not any("cache_control" in block for block in first_user["content"])
 assert result["messages"][2]["content"] == [
     {"type": "text", "text": "Pong", "cache_control": {"type": "ephemeral"}}
 ]
-# The structured tool result must stay byte-identical.
-assert result["messages"][3] == request["messages"][3]
+# The tool result takes its breakpoint at message level, which is where LiteLLM
+# reads it (`convert_to_anthropic_tool_result:1844`); its payload is untouched.
+tool_result = result["messages"][3]
+assert tool_result["cache_control"] == {"type": "ephemeral"}
+assert {k: v for k, v in tool_result.items() if k != "cache_control"} == request["messages"][3]
 assert namespace["_count_cache_breakpoints"](result["messages"]) == 2
 assert result["extra_headers"]["User-Agent"] == "claude-cli/2.1.246 (external, claude-desktop)"
 assert result["extra_headers"]["x-app"] == "cli"
@@ -166,25 +168,34 @@ agent_turn = inject({
     ],
 })
 messages = agent_turn["messages"]
-# Mzr anchors the last two markable turns; the assistant tool call and the tool
-# result are not markable, so the two user turns carry the markers.
+# Mzr anchors the last two markable turns. The tool result is markable at
+# message level, so the window sits at the tail: tool result plus final user
+# turn. The opening user turn stays unmarked, and the assistant tool call is
+# skipped here because LiteLLM drops calls without `type: "function"`
+# (`convert_to_anthropic_tool_invoke:1952`).
 assert namespace["_count_cache_breakpoints"](messages) == 2
 assert messages[-1]["content"] == [
     {"type": "text", "text": "latest question", "cache_control": {"type": "ephemeral"}}
 ]
-assert messages[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+assert messages[3]["cache_control"] == {"type": "ephemeral"}
+assert not any("cache_control" in block for block in messages[1]["content"])
 # No marker carries a TTL: reference retention defaults to "short".
-assert all(
-    block.get("cache_control", {}).get("ttl") is None
+markers = [
+    message["cache_control"] for message in messages if message.get("cache_control")
+] + [
+    block["cache_control"]
     for message in messages
     if isinstance(message.get("content"), list)
     for block in message["content"]
-    if isinstance(block, dict)
-)
+    if isinstance(block, dict) and block.get("cache_control")
+]
+assert markers and all(marker.get("ttl") is None for marker in markers)
 # Structured payloads must survive untouched.
 assert messages[2]["tool_calls"][0]["id"] == "c1"
 assert messages[2]["content"] is None
-assert messages[3] == {"role": "tool", "tool_call_id": "c1", "content": "file body"}
+assert {k: v for k, v in messages[3].items() if k != "cache_control"} == {
+    "role": "tool", "tool_call_id": "c1", "content": "file body",
+}
 
 # Reasoning blocks are never anchors (Azr skips thinking/redacted_thinking).
 thinking_tail = inject({
@@ -214,8 +225,9 @@ nudged = inject({
 })
 assert nudged["messages"][-1]["content"] == "Continue."
 
-# A tool result as the newest turn is not a candidate: the marker would corrupt
-# the schema, so the tail falls back to the newest plain-text message.
+# A tool result as the newest turn is the freshest anchor: LiteLLM reads a
+# message-level breakpoint there, so the window reaches the true tail instead
+# of stalling on an older text turn.
 tool_tail = inject({
     "model": "claude-sonnet-5",
     "messages": [
@@ -224,8 +236,12 @@ tool_tail = inject({
         {"role": "tool", "tool_call_id": "c9", "content": "result"},
     ],
 })
-assert tool_tail["messages"][-1] == {"role": "tool", "tool_call_id": "c9", "content": "result"}
-assert namespace["_count_cache_breakpoints"](tool_tail["messages"]) == 1
+newest = tool_tail["messages"][-1]
+assert newest["cache_control"] == {"type": "ephemeral"}
+assert {k: v for k, v in newest.items() if k != "cache_control"} == {
+    "role": "tool", "tool_call_id": "c9", "content": "result",
+}
+assert namespace["_count_cache_breakpoints"](tool_tail["messages"]) == 2
 
 # Single user turn: the static marker already covers it, so no duplicate.
 single = inject({
