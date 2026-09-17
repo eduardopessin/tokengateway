@@ -53,6 +53,103 @@ This document details the system architecture of **TokenGateway** and how it int
 - Sits inside the LiteLLM container without modifying the image binary.
 - Translates standard OpenAI Chat Completion calls into provider-native wire protocols with full streaming and tool calling support.
 
+#### Reasoning visibility
+
+Reasoning text is the part of a subscription response that is easiest to lose, and
+every loss looks like "the model just doesn't show its thinking":
+
+- **`redact-thinking-2026-02-12` must not be in `anthropic-beta`.** With that beta,
+  Anthropic returns `thinking` blocks that are signed but carry no text. Measured on
+  `claude-sonnet-4-6`: 74 characters of reasoning without the beta, 0 with it. The beta
+  list here is omp's `buildCoworkBetas`, which also leaves out `context-1m-2025-08-07`
+  because it returns credit `429`s on subscription tokens.
+- **Claude 4.7+ and the 5.x line only reason in adaptive mode**, and Anthropic's default
+  for `thinking.display` is `"omitted"` — a signed, empty block. The bridge sends
+  `thinking: {type: "adaptive", display: "summarized"}` plus
+  `output_config: {effort}`. Measured on `claude-opus-5`: 225 characters with
+  `summarized`, 0 with `omitted`. Models up to 4.6 keep
+  `thinking: {type: "enabled", budget_tokens: N}`.
+- **Codex only returns reasoning when the request carries a `reasoning` object.**
+  Without it the stream contains zero `response.reasoning_summary_text.delta` events,
+  so the bridge always sends one (default effort `medium`) and honours the client's
+  `summary` (`auto` | `detailed` | `concise`).
+- **Antigravity needs `thinkingConfig` on every request.** Omitting it makes Cloud Code
+  Assist re-apply its server defaults and bill thinking tokens without returning the
+  text. Antigravity uses *budget* transport (the `thinkingLevel` dialect belongs to
+  gemini-cli), so the budget advertised by the account catalogue for the chosen variant
+  is used: `-low` 1000, `-medium` 4000, `-high` dynamic, `gemini-pro-agent` 10001.
+  `thinkingLevel: MINIMAL` never goes on the wire — `gemini-3.8-*` and
+  `gemini-3.1-pro` answer `400 Thinking level MINIMAL is not supported for this model`.
+
+Reasoning reaches the client in `choices[].message.reasoning_content` on chat
+completions and as `reasoning` output items on `/v1/responses`. A client that only
+renders `content` needs `merge_reasoning_content_in_choices: true` on the model entry,
+which wraps the reasoning in `<think>...</think>`.
+
+#### The `/v1/responses` route
+
+Clients that follow LiteLLM's own model discovery — omp among them — call OpenAI-backed
+models over `openai-responses` precisely to keep reasoning summaries. That route reaches
+neither `litellm.acompletion` nor `Router.acompletion`, so before this was wired it went
+straight upstream with the wrong credential:
+
+| model | before |
+|---|---|
+| `codex`, `gpt-*` | `401 Missing scopes: api.responses.write` |
+| `gemini-*` | `401 Incorrect API key provided: ya29....` — the Google OAuth token sent to `api.openai.com` |
+| `claude-*` | `200`, but with no `reasoning` items |
+
+Patching `litellm.aresponses` is not enough: the Router captures the function during its
+own `__init__` by another path. The boundary common to every route is
+`litellm.proxy.route_llm_request.route_request`, where a request carrying `input` and no
+`messages` is flagged with `use_chat_completions_api=True`. LiteLLM then translates
+Responses into chat completions, calls `litellm.acompletion` — which the bridges already
+cover — and rebuilds the `reasoning` items from `reasoning_content`.
+
+Two details make that translation work:
+
+- On that route `reasoning` arrives as an **object** (`{effort, summary}`) and LiteLLM
+  forwards the whole object as `reasoning_effort`. Treating it as a string put
+  `"{'effort': 'medium', ...}"` on the wire, which Codex rejects with `400 Invalid
+  value`.
+- Streaming replies must be a `CustomStreamWrapper`; a bare async generator answers
+  `500 Unexpected response type: <class 'async_generator'>`. And the final usage chunk
+  must carry a `choices` entry: the iterator calls `_is_reasoning_end(chunk)`, which
+  dereferences `chunk.choices[0]` unguarded, so `choices: []` raised `IndexError` and the
+  stream died before emitting `response.completed` — leaving clients waiting forever on
+  exactly the models that stream reasoning.
+
+#### Wildcards and silent substitution
+
+Per-family wildcards (`claude-*`, `gpt-*`, `gemini-*`) are what let a newly released
+model work without editing the config, and the effort variant is resolved from the
+account catalogue. What they must not do is answer with a different model:
+
+- An arbitrary name is only remapped when it is a **deliberate alias** of a served
+  model. `gpt-4.1`, `o3-mini` and `gpt-3.5-turbo` were being answered by `gpt-5.5` with
+  the `model` field echoing the requested name, so billing and comparisons lied.
+- An unknown gemini family raises instead of falling back to `gemini-2.5-flash`.
+- A bare `- model_name: "*"` catch-all is worse still: every typo is answered by whatever
+  backend it points at. Keep it out of the config.
+
+Health checks on wildcard entries need help, because
+`ahealth_check_wildcard_models` probes the cheapest models in LiteLLM's public price map
+(`container`, `gpt-5-nano*` for provider `openai`) and a subscription serves none of
+them. The probe is chosen from the pattern instead: `gemini-*` → `gemini-2.5-flash`,
+`claude-*` → `claude-haiku-4-5`, `gpt-*` → `gpt-5.5`.
+
+#### Deployment identity
+
+Pin `model_info.id` on every entry. Without it the Router derives the id in
+`_generate_model_id` as a sha256 over every key and value of `litellm_params`: the id is
+a fingerprint of the parameters, so it changes whenever any of them changes and is
+recomputed on every restart. Anything addressing a deployment by id — `GET
+/health?model_id=`, the admin UI, dashboards — then answers `404 Model with ID ... not
+found`. Wildcard entries additionally materialise per-request deployments
+(`original_model_id` is set on those), which live only in the router's memory and
+disappear on restart, so health-checking those by id is unstable by construction; use
+`?model=<name>`.
+
 #### Prompt Caching Breakpoints (Anthropic)
 
 Anthropic caches everything **up to** a `cache_control` marker, so where the marker goes
