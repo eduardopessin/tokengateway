@@ -216,6 +216,63 @@ Two consequences worth stating, because they are what made this worth fixing:
 - `response.refusal.delta` is read as visible text on the non-streaming Codex path too.
   Without that branch a refused turn returned empty `content` with a clean `stop`.
 
+#### Multimodal input
+
+The Antigravity bridge kept only the text parts of a message, so an image part
+reached the model as nothing at all and the answer described an image it never
+saw. The Codex bridge already mapped media, so the asymmetry was unintentional
+rather than a decision. The wire shape depends on the client part:
+
+| Client part | Wire | Measured |
+|---|---|---|
+| `image_url` with a `data:` URI | `inlineData {mimeType, data}` | accepted; the model named the colour of a solid-colour PNG correctly, and the same request without the image named a different colour |
+| `data:` URI left inside `data` | rejected | `400 Invalid value at 'request.contents[0].parts[0].inline_data.data'` |
+| `image_url` with an http(s) URL | fetched, then `inlineData` | `fileData` with a web URL answers `404 Requested entity was not found`, so the bridge must fetch it |
+| `gs://` or a Files API URI | `fileData {mimeType, fileUri}` | passed through |
+| `file` with base64 `file_data` | `inlineData` with the declared mime | a PDF inlined as `application/pdf` returned the word printed on the page |
+| image in a `role: "tool"` result | `functionResponse.parts[]` | seen by `gemini-3.8-flash`, `gemini-3.1-pro`, `gemini-3.1-flash-lite`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` and `gemini-pro-agent` |
+
+The last row is a deliberate deviation from the reference. omp uses the inline
+`functionResponse.parts` form only on Gemini 3+ and buffers older generations
+into a following user turn (`pendingToolImageParts`), because the public API
+rejects the inline form there. On this backend it works on every generation the
+account serves, so the buffer is not needed and the history carries one fewer
+synthetic turn.
+
+Failure is loud by construction: a fetch that does not succeed raises with the
+URL and the status, and media above 12 MB raises instead of being inlined.
+Silently dropping the part is the behaviour this section exists to prevent.
+
+#### Thinking-loop guard
+
+A runaway reasoning turn is not merely slow: it bills `thoughtsTokenCount` up to
+the output ceiling and produces no answer at all. The four escape shapes and
+their thresholds are omp's `ThinkingLoopDetector`
+(`packages/ai/src/utils/thinking-loop.ts`, described in
+`provider-quirks.md:192`):
+
+| Shape | Threshold |
+|---|---|
+| Verbatim tail repetition | 180 repeated characters within a 4096-character window |
+| Near-duplicate segments | trigram Jaccard >= 0.8 across the last 16 segments |
+| Progress stall | novelty <= 0.2 across 8 consecutive segments with no new concrete anchor |
+| Titled-summary runaway | 24 titles |
+
+The deviation is in the reaction, not the detection: omp emits a *retryable*
+error and re-attempts, while this bridge raises. By the time a loop is
+detectable — 8 segments, or 180 repeated characters — `reasoning_content` has
+already been flushed to the client, so a retry would duplicate reasoning inside
+the same stream.
+
+A guard that kills good turns is worse than no guard, so the thresholds were
+checked against real traffic: fed with 8 real reasoning streams from
+`gemini-3.8-flash-medium` and `gemini-3.1-pro-low` (328 to 2099 characters of
+thinking), zero triggered. The pro model emits 3 to 5 titled summaries per turn
+against a threshold of 24.
+
+Only the Gemini family is watched here, mirroring omp, which monitors Gemini,
+DeepSeek and Grok.
+
 #### Deployment identity
 
 Pin `model_info.id` on every entry. Without it the Router derives the id in

@@ -147,6 +147,8 @@ Open `http://localhost:3737` to access the Quota Dashboard.
 | **OpenAI** | ChatGPT Plus / Pro | `gpt-5.6-terra`, `gpt-5.6-sol`, `gpt-5.6-luna`, `gpt-6-astra` | ✔️ Full | ✔️ Full |
 | **Local vLLM** | Self-Hosted | `qwen-agent-coder` (Qwen 3.5 27B NVFP4) | ✔️ Full | ✔️ Full |
 
+**Vision input:** `gemini-*` now accepts image and document parts — `image_url` with a `data:` URI, an http(s) URL (fetched and inlined by the gateway), a `gs://`/Files API URI, base64 `file_data`, and images returned inside a tool result. Previously only the text parts survived the bridge. See [Multimodal input](docs/architecture.md#multimodal-input).
+
 ---
 
 ## 📖 Documentation
