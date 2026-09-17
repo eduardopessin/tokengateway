@@ -1,45 +1,123 @@
 model_list:
-  # --- Anthropic Claude Models ---
-  - model_name: claude-sonnet-5
-    litellm_params:
-      model: claude-3-7-sonnet-20250219
-      api_key: os.environ/ANTHROPIC_OAUTH_TOKEN
+  # `model_info.id` is pinned on every entry. Without it the Router derives the
+  # id in _generate_model_id as a sha256 over every key and value of
+  # litellm_params, so the id is a fingerprint of the parameters: it changes
+  # whenever any of them changes and is recomputed on every restart. Anything
+  # that addresses a deployment by id -- `GET /health?model_id=`, the admin UI,
+  # dashboards -- then answers 404 "Model with ID ... not found".
 
+  # --- Anthropic Claude (Max subscription over OAuth) ---
+  # Wire ids are the model the account actually serves. Adaptive-thinking
+  # models (Opus 4.7+, Sonnet/Opus 5) are sent `thinking: {type: "adaptive",
+  # display: "summarized"}` by the plugin; older lines keep the budget shape.
   - model_name: claude-opus-5
     litellm_params:
-      model: claude-3-opus-20240229
+      model: anthropic/claude-opus-5
       api_key: os.environ/ANTHROPIC_OAUTH_TOKEN
+    model_info:
+      id: "claude-opus-5"
+
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_OAUTH_TOKEN
+    model_info:
+      id: "claude-sonnet-5"
+
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/ANTHROPIC_OAUTH_TOKEN
+    model_info:
+      id: "claude-sonnet-4-6"
 
   - model_name: claude-haiku-4-5
     litellm_params:
-      model: claude-3-5-haiku-20241022
+      model: anthropic/claude-haiku-4-5
       api_key: os.environ/ANTHROPIC_OAUTH_TOKEN
+    model_info:
+      id: "claude-haiku-4-5"
 
-  # --- OpenAI Codex Models ---
+  # --- OpenAI Codex (ChatGPT Plus/Pro subscription over OAuth) ---
+  # A ChatGPT account serves only part of the public catalogue: the 5.4 family
+  # answers "The 'gpt-5.4' model is not supported when using Codex with a
+  # ChatGPT account". Check /v1/models on the proxy for what your account has.
+  - model_name: gpt-5.5
+    litellm_params:
+      model: openai/gpt-5.5
+      api_key: os.environ/OPENAI_CODEX_OAUTH_TOKEN
+      custom_llm_provider: openai
+      additional_drop_params: ["max_tokens", "max_output_tokens", "max_completion_tokens"]
+    model_info:
+      id: "gpt-5.5"
+
   - model_name: gpt-5.6-terra
     litellm_params:
       model: openai/gpt-5.6-terra
       api_key: os.environ/OPENAI_CODEX_OAUTH_TOKEN
       custom_llm_provider: openai
+      additional_drop_params: ["max_tokens", "max_output_tokens", "max_completion_tokens"]
+    model_info:
+      id: "gpt-5.6-terra"
 
-  - model_name: gpt-5.4
+  # --- Google Antigravity (Cloud Code Assist over OAuth) ---
+  # The plugin resolves the effort variant (-low / -medium / -high / -agent)
+  # from the account catalogue, so declare the family name here.
+  - model_name: gemini-3.8-flash
     litellm_params:
-      model: openai/gpt-5.4
+      model: openai/gemini-3.8-flash
+      api_key: os.environ/GOOGLE_ANTIGRAVITY_OAUTH_TOKEN
+      custom_llm_provider: openai
+    model_info:
+      id: "gemini-3.8-flash"
+
+  - model_name: gemini-2.5-flash
+    litellm_params:
+      model: openai/gemini-2.5-flash
+      api_key: os.environ/GOOGLE_ANTIGRAVITY_OAUTH_TOKEN
+      custom_llm_provider: openai
+    model_info:
+      id: "gemini-2.5-flash"
+
+  # --- Optional: per-family wildcards ---
+  # These let a newly released model of the family work without editing this
+  # file. Names the subscription does not serve fail with the upstream error
+  # instead of being answered by another model.
+  #
+  # Avoid a bare `- model_name: "*"` catch-all: it answers every typo and every
+  # unknown model with whatever backend it points at, echoing the requested
+  # name in the response, so the caller never learns it talked to something
+  # else.
+  - model_name: 'claude-*'
+    litellm_params:
+      model: anthropic/claude-*
+      api_key: os.environ/ANTHROPIC_OAUTH_TOKEN
+    model_info:
+      id: "claude-*"
+
+  - model_name: 'gpt-*'
+    litellm_params:
+      model: openai/gpt-*
       api_key: os.environ/OPENAI_CODEX_OAUTH_TOKEN
       custom_llm_provider: openai
+      additional_drop_params: ["max_tokens", "max_output_tokens", "max_completion_tokens"]
+    model_info:
+      id: "gpt-*"
 
-  # --- Google Antigravity Models ---
-  - model_name: gemini-3.7-flash
+  - model_name: 'gemini-*'
     litellm_params:
-      model: openai/gemini-3.7-flash
+      model: openai/gemini-*
       api_key: os.environ/GOOGLE_ANTIGRAVITY_OAUTH_TOKEN
       custom_llm_provider: openai
-
-  - model_name: gemini-2.5-pro
-    litellm_params:
-      model: openai/gemini-2.5-pro
-      api_key: os.environ/GOOGLE_ANTIGRAVITY_OAUTH_TOKEN
-      custom_llm_provider: openai
+    model_info:
+      id: "gemini-*"
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  drop_params: true
+  # Reasoning is returned in `choices[].message.reasoning_content` (chat
+  # completions) and as `reasoning` output items (/v1/responses). Clients that
+  # only render `content` need `merge_reasoning_content_in_choices: true` on the
+  # model entry, which wraps the reasoning in <think>...</think>.
