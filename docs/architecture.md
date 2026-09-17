@@ -63,12 +63,46 @@ every loss looks like "the model just doesn't show its thinking":
   `claude-sonnet-4-6`: 74 characters of reasoning without the beta, 0 with it. The beta
   list here is omp's `buildCoworkBetas`, which also leaves out `context-1m-2025-08-07`
   because it returns credit `429`s on subscription tokens.
-- **Claude 4.7+ and the 5.x line only reason in adaptive mode**, and Anthropic's default
-  for `thinking.display` is `"omitted"` — a signed, empty block. The bridge sends
-  `thinking: {type: "adaptive", display: "summarized"}` plus
+- **Adaptive is the default, and the exception list names the models that reject it.**
+  Anthropic's default for `thinking.display` is `"omitted"` — a signed, empty block —
+  so the bridge sends `thinking: {type: "adaptive", display: "summarized"}` plus
   `output_config: {effort}`. Measured on `claude-opus-5`: 225 characters with
-  `summarized`, 0 with `omitted`. Models up to 4.6 keep
-  `thinking: {type: "enabled", budget_tokens: N}`.
+  `summarized`, 0 with `omitted`. The direction of the default is decided by the
+  asymmetry of the two failures, measured model by model (characters of reasoning
+  returned):
+
+  | Model | adaptive | budget | Verdict |
+  |---|---|---|---|
+  | `claude-opus-5` | 82 | **0** | adaptive required |
+  | `claude-fable-5` | 83 | **0** | adaptive required |
+  | `claude-sonnet-5` | 58 | 59 | either |
+  | `claude-opus-4-8` | 61 | 62 | either |
+  | `claude-opus-4-6` | 101 | 101 | either |
+  | `claude-sonnet-4-6` | 104 | 105 | either |
+  | `claude-opus-4-5` | **400** | 233 | budget only |
+  | `claude-sonnet-4-5` | **400** | 367 | budget only |
+  | `claude-haiku-4-5` | **400** | 413 | budget only |
+
+  Guessing adaptive fails loudly with `400 adaptive thinking is not supported on this
+  model`; guessing budget returns `200` with zero characters of reasoning. So the list
+  enumerates the refusers, and an alias (`claude-opus` resolves to `claude-opus-4-8`)
+  or a model not yet enumerated lands on the side that is detectable.
+- **The effort ladder reaches `max`.** `minimal` has no wire tier and maps to `low`;
+  `low` through `max` reach the wire as themselves. Measured on `claude-opus-5`:
+  output tokens 164 at `high`, 273 at `xhigh`, 275 at `max`, so collapsing the top
+  two into `high` hid two tiers that exist.
+- **`max_tokens` is a floor, never a ceiling.** `ensureMaxTokensForThinking` only ever
+  raises it, to at least `budget + 1024`. Measured: `max_tokens: 64000` is accepted on
+  a subscription token, so the 16384 cap this bridge used to apply truncated answers
+  the client had asked for. Only the key the client sent is written: filling both
+  `max_tokens` and `max_completion_tokens` made the fold of the latter into the former
+  overwrite the client's value.
+- **Sampling parameters are suppressed while thinking is active.** `temperature` must
+  be 1 and `top_p` must be >= 0.95 or absent, both enforced upstream with a `400`.
+- **A forced `tool_choice` only collides with budget thinking.** Measured on
+  `claude-sonnet-4-6`: `400 Thinking may not be enabled when tool_choice forces tool
+  use`; the same pair with adaptive thinking returns `200`. So thinking is dropped only
+  where it actually collides.
 - **Codex only returns reasoning when the request carries a `reasoning` object.**
   Without it the stream contains zero `response.reasoning_summary_text.delta` events,
   so the bridge always sends one (default effort `medium`) and honours the client's
@@ -131,12 +165,56 @@ account catalogue. What they must not do is answer with a different model:
 - An unknown gemini family raises instead of falling back to `gemini-2.5-flash`.
 - A bare `- model_name: "*"` catch-all is worse still: every typo is answered by whatever
   backend it points at. Keep it out of the config.
+- **A capacity error does not authorise a different model.** On `404`/`503` the
+  Antigravity path used to resend the request as `gemini-3.7-flash-low` while the
+  response kept echoing the requested name, so a client asking for `gemini-3.1-pro`
+  could receive flash labelled as pro and be billed as pro. omp's failover is on the
+  *endpoint* only (daily to sandbox, keeping the last good host).
+- **A variant that does not exist upstream is refused, not approximated.** Stripping a
+  `-thinking` suffix to reach the family made `gemini-3.8-flash-thinking` — a name with
+  no upstream deployment — answer as `-low`. Only suffixes that name a real variant are
+  stripped, and a name that *is* a served variant is honoured as sent, so
+  `gemini-3.8-flash-tiered` reaches `-tiered` instead of being overridden by the
+  requested effort.
+- **A version alias is a lie; a family alias is not.** `codex`, `gpt-5` and `gpt-6` name
+  no version, so resolving them to the served model is honest. `gpt-5.4` does name one,
+  and that family is refused by a ChatGPT account, so it is no longer served at all.
+- The served catalogue is the account's own: `POST /v1internal:fetchAvailableModels`
+  minus the entries the same response lists in `deprecatedModelIds`. That is how
+  `gemini-3.1-pro-high` appears available while answering `400 INVALID_ARGUMENT`.
 
 Health checks on wildcard entries need help, because
 `ahealth_check_wildcard_models` probes the cheapest models in LiteLLM's public price map
 (`container`, `gpt-5-nano*` for provider `openai`) and a subscription serves none of
 them. The probe is chosen from the pattern instead: `gemini-*` → `gemini-2.5-flash`,
 `claude-*` → `claude-haiku-4-5`, `gpt-*` → `gpt-5.5`.
+
+#### Stop reasons
+
+A bridge that answers the request itself owns the `finish_reason`, and deriving it from
+"did we see a tool call" reports every truncation and every server-side block as a clean
+`stop`. Both bridges read the terminal signal instead.
+
+| Upstream | Value | `finish_reason` |
+|---|---|---|
+| Antigravity | `MAX_TOKENS` | `length` |
+| Antigravity | `SAFETY`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `IMAGE_SAFETY`, `RECITATION`, `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`, `NO_IMAGE`, `OTHER` | `content_filter` |
+| Antigravity | `STOP`, absent | `stop` |
+| Codex | `response.incomplete` | `length` |
+| Codex | `response.completed` | `stop` |
+
+A tool call outranks both: a turn that called a tool and also hit the token ceiling is
+reported as `tool_calls`.
+
+Two consequences worth stating, because they are what made this worth fixing:
+
+- The empty-stream retry is gated on `stop`. Google can close with `finishReason: STOP`
+  and no parts, which is worth retrying; a turn that came back empty because
+  `max_tokens` was consumed by thinking, or because a safety filter fired, is
+  deterministic — retrying it paid for the prompt four times to obtain the same empty
+  answer and hid the real reason from the client.
+- `response.refusal.delta` is read as visible text on the non-streaming Codex path too.
+  Without that branch a refused turn returned empty `content` with a clean `stop`.
 
 #### Deployment identity
 
