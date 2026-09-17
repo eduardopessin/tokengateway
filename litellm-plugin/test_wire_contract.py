@@ -1,28 +1,69 @@
 import ast
 import copy
+import hashlib
 import json
+import sys
+import time
 from pathlib import Path
 
 source = Path(__file__).with_name("sitecustomize.py").read_text()
 module = ast.parse(source)
 names = {
     "_content_to_text",
+    "_content_to_codex_parts",
+    "_codex_image_part",
+    "_codex_file_part",
+    "_codex_composite_call_id",
+    "_codex_split_call_id",
+    "_codex_wire_generation",
+    "_codex_prompt_cache_key",
+    "_normalize_effort",
     "_repair_codex_tool_pairs",
     "_messages_to_codex_input",
     "_tools_to_codex_tools",
     "_codex_tool_choice",
     "_codex_request_body",
+    "_codex_remember_unsupported",
     "_google_model_supports_function_ids",
     "_google_text_parts",
     "_google_tool_choice",
+    "_google_is_planning_leak",
     "_tools_to_antigravity_tools",
     "_tool_result_value",
     "_messages_to_antigravity_payload",
+    "_antigravity_base_family",
     "_map_antigravity_model",
+    "_antigravity_request_id",
 }
 functions = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name in names]
-namespace = {"json": json, "uuid": type("Uuid", (), {"uuid4": staticmethod(lambda: "request-id")})(), "_thought_signatures": {}}
-exec(compile(ast.Module(body=functions, type_ignores=[]), "sitecustomize.py", "exec"), namespace)
+assert len(functions) == len(names), f"missing: {names - {f.name for f in functions}}"
+constants = [
+    node for node in module.body
+    if isinstance(node, ast.Assign)
+    and any(
+        getattr(t, "id", "").startswith(("_CODEX_", "_GOOGLE_", "_ANTIGRAVITY_", "_antigravity_"))
+        for t in node.targets
+    )
+]
+namespace = {
+    "json": json,
+    "hashlib": hashlib,
+    "time": time,
+    "uuid": type("Uuid", (), {
+        "uuid4": staticmethod(lambda: type("U", (), {
+            "hex": "requestid",
+            "__str__": lambda self: "request-id",
+        })())
+    })(),
+    "sys": sys,
+    "_thought_signatures": {},
+    "_remember_thought_signature": lambda call_id, signature: None,
+    # Only the timeout constants touch httpx at import time; the wire builders
+    # under test never open a connection.
+    "httpx": type("Httpx", (), {"Timeout": staticmethod(lambda *a, **k: None)})(),
+    "os": type("Os", (), {"environ": {}})(),
+}
+exec(compile(ast.Module(body=constants + functions, type_ignores=[]), "sitecustomize.py", "exec"), namespace)
 
 codex = namespace["_codex_request_body"](
     "gpt-5.6-terra",
@@ -89,3 +130,113 @@ omp_gemini = namespace["_messages_to_antigravity_payload"](
 )
 assert omp_gemini["request"]["generationConfig"]["maxOutputTokens"] == 8192
 print("OMP-shaped max_completion_tokens parity OK (Codex + Antigravity)")
+
+
+# --- Codex payload: multimodal, composite ids, hosted tools, juice ---------
+# Before this, _content_to_text dropped everything that was not text, so a
+# request carrying an image reached the model without the image.
+PNG = "data:image/png;base64,iVBORw0KGgo="
+multimodal = namespace["_codex_request_body"](
+    "gpt-5.5",
+    [{"role": "user", "content": [
+        {"type": "text", "text": "what colour?"},
+        {"type": "image_url", "image_url": {"url": PNG, "detail": "original"}},
+        {"type": "file", "file": {"filename": "a.txt", "file_data": "data:text/plain;base64,aGk="}},
+    ]}],
+    None,
+    None,
+)
+parts = multimodal["input"][0]["content"]
+assert [part["type"] for part in parts] == ["input_text", "input_image", "input_file"]
+# Codex rejects detail "original".
+assert parts[1]["detail"] == "auto"
+assert parts[2]["filename"] == "a.txt"
+print("Codex multimodal input OK")
+
+# Responses identifies a call by (call_id, item_id); the composite id keeps the
+# pair addressable and the replay must send the bare call_id back.
+composite = namespace["_codex_composite_call_id"]("call_a", "fc_1")
+assert composite == "call_a|fc_1"
+assert namespace["_codex_split_call_id"](composite) == "call_a"
+replay = namespace["_codex_request_body"](
+    "gpt-5.5",
+    [
+        {"role": "assistant", "tool_calls": [{"id": composite, "function": {"name": "read", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": composite, "content": "ok"},
+    ],
+    None,
+    None,
+)
+assert [item.get("call_id") for item in replay["input"] if item.get("call_id")] == ["call_a", "call_a"]
+print("Codex composite tool-call ids OK")
+
+# Hosted tools carry no `function` and were being dropped.
+hosted = namespace["_codex_request_body"](
+    "gpt-5.6-terra",
+    [{"role": "user", "content": "search"}],
+    [{"type": "web_search"}, {"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}],
+    {"reasoning_effort": "none"},
+)
+assert [tool["type"] for tool in hosted["tools"]] == ["web_search", "function"]
+# Reasoning off on 5.6+ pins the juice instead of sending `reasoning`.
+assert "reasoning" not in hosted
+assert "# Juice: 0 !important" in json.dumps(hosted["input"])
+older = namespace["_codex_request_body"]("gpt-5.5", [{"role": "user", "content": "x"}], None, {"reasoning_effort": "none"})
+assert "Juice" not in json.dumps(older["input"])
+print("Codex hosted tools and juice item OK")
+
+# The prompt cache key must stay identical as the conversation grows, or the
+# backend never reuses the cached prefix.
+head = [{"role": "system", "content": "rules"}, {"role": "user", "content": "first"}]
+assert namespace["_codex_prompt_cache_key"](head) == namespace["_codex_prompt_cache_key"](
+    head + [{"role": "assistant", "content": "reply"}, {"role": "user", "content": "second"}]
+)
+print("Codex prompt cache key stability OK")
+
+# Remapping an arbitrary name to the fallback model answered 200 while the
+# `model` field echoed the requested name: billing and comparisons lied. Only
+# deliberate aliases may be remapped.
+for alias in ("gpt-5.4", "codex", "gpt-6"):
+    assert namespace["_codex_remember_unsupported"]({"model": alias}) is True, alias
+for arbitrary in ("gpt-4.1", "o3-mini", "gpt-3.5-turbo"):
+    assert namespace["_codex_remember_unsupported"]({"model": arbitrary}) is False, arbitrary
+print("Codex honest model fallback OK")
+
+# --- Antigravity: thinking level, unknown families, planning leak ----------
+# gemini-3.8-* and gemini-3.1-pro answer 400 "Thinking level MINIMAL is not
+# supported for this model", so MINIMAL must never reach the wire.
+for effort in ("none", "minimal", "low", "medium", "high", "max"):
+    config = namespace["_messages_to_antigravity_payload"](
+        "gemini-3.8-flash", [{"role": "user", "content": "x"}], "project", None,
+        {"reasoning_effort": effort},
+    )["request"]["generationConfig"]["thinkingConfig"]
+    assert config.get("thinkingLevel") != "MINIMAL", effort
+    assert config["includeThoughts"] is (effort != "none"), effort
+print("Antigravity thinking level clamp OK")
+
+# The gemini-* wildcard used to make any invented name answer as
+# gemini-2.5-flash with the requested name echoed back.
+try:
+    namespace["_map_antigravity_model"]("gemini-9.9-ultra", "high")
+except Exception as error:
+    assert "not served by this account" in str(error)
+else:  # pragma: no cover
+    raise AssertionError("an unknown gemini family must not fall back silently")
+assert namespace["_antigravity_base_family"]("gemini-3.8-flash-high") == "gemini-3.8-flash"
+print("Antigravity unknown family fails loudly OK")
+
+# Flash models leak their planning object into visible text; a legitimate JSON
+# answer must survive.
+leak = namespace["_google_is_planning_leak"]
+assert leak('{"thought":"planning","_i":3}')
+assert leak('{"thought":"only"}')
+assert not leak('{"result": 42, "ok": true}')
+assert not leak("plain text")
+assert not leak('{"call":"f"}')
+print("Antigravity planning leak filter OK")
+
+# The Responses route sends reasoning as an object.
+assert namespace["_normalize_effort"]({"effort": "high", "summary": "detailed"}) == ("high", "detailed")
+assert namespace["_normalize_effort"]("low") == ("low", None)
+assert namespace["_normalize_effort"](None) == (None, None)
+print("Reasoning effort normalisation OK")
