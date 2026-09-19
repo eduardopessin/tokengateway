@@ -14,6 +14,32 @@
 
 ---
 
+> ### The LiteLLM plugin now lives in its own repository
+>
+> `litellm-plugin/sitecustomize.py` here is superseded by
+> **[litellm-mysubs](https://github.com/eduardopessin/litellm-mysubs)** — same purpose, installed
+> as a normal package instead of a `PYTHONPATH` injection:
+>
+> ```bash
+> pip install litellm-mysubs && mysubs-setup
+> ```
+>
+> What changed, beyond packaging:
+>
+> - **No `sitecustomize.py`.** It hooks through `litellm_settings.callbacks`, one line in
+>   `config.yaml`. Nothing is injected into every Python process on the host.
+> - **Refresh is safe across workers.** A `flock` and a single designated refresh owner,
+>   verified with four real worker processes and a token forced to expire — the
+>   `invalid_grant` drift described below is handled.
+> - **The unauthenticated credential API is gone.** That endpoint served refresh tokens with
+>   no auth; it does not exist in the new one.
+> - **A UI on the proxy itself** for OAuth, model discovery and applying models.
+>
+> This repository remains the dashboard, the quota views and the desktop app. If you came
+> here for the LiteLLM side, go there.
+
+---
+
 ## 💡 The Problem
 
 Developers and AI engineers pay expensive monthly subscriptions (**Claude Max** \$100–\$200/mo, **ChatGPT Plus/Pro**, **Google AI**), but face massive friction when using them in coding agents (*Oh My Pi*, *Claude Code*, *OpenHands*, *Cline*) or local clusters:
